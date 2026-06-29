@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import pathlib
 import re
-import sys
 from typing import Any
 
 from common import Manifest, atomic_write_json, ensure_state, input_hash, rel, resolve_root, resolve_under, sha256_file
@@ -68,25 +67,22 @@ def build_index(products: list[dict[str, Any]]) -> dict[str, Any]:
     return index
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Parse Kconfig .config files into product configuration index.")
-    parser.add_argument("--root", default=".")
-    parser.add_argument("--config-dir", default="config")
-    parser.add_argument("--state-dir", default="state")
-    parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
-
-    root = resolve_root(args.root)
-    state = ensure_state(root, args.state_dir)
-    config_root = resolve_under(root, args.config_dir)
+def parse_kconfig_stage(
+    root: str | pathlib.Path = ".",
+    config_dir: str = "config",
+    state_dir: str = "state",
+    force: bool = False,
+) -> dict[str, Any]:
+    root = resolve_root(root)
+    state = ensure_state(root, state_dir)
+    config_root = resolve_under(root, config_dir)
     output = state / "products.json"
     manifest = Manifest(root, state)
 
     files = find_config_files(config_root)
     digest = input_hash([str(config_root), *[f"{rel(path, root)}:{sha256_file(path)}" for path in files]])
-    if not args.force and manifest.done("parse_kconfig", "all", digest, [output]):
-        print(f"parse_kconfig: reused {rel(output, root)}")
-        return 0
+    if not force and manifest.done("parse_kconfig", "all", digest, [output]):
+        return {"stage": "parse_kconfig", "status": "done", "reused": True, "products": len(files), "output": rel(output, root)}
 
     products = [parse_one(path, config_root, root) for path in files]
     result = {
@@ -97,7 +93,22 @@ def main() -> int:
     }
     atomic_write_json(output, result)
     manifest.mark("parse_kconfig", "all", "done", digest, [output])
-    print(f"parse_kconfig: parsed {len(products)} product config(s)")
+    return {"stage": "parse_kconfig", "status": "done", "reused": False, "products": len(products), "output": rel(output, root)}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Parse Kconfig .config files into product configuration index.")
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--config-dir", default="config")
+    parser.add_argument("--state-dir", default="state")
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args()
+
+    result = parse_kconfig_stage(args.root, args.config_dir, args.state_dir, args.force)
+    if result["reused"]:
+        print(f"parse_kconfig: reused {result['output']}")
+    else:
+        print(f"parse_kconfig: parsed {result['products']} product config(s)")
     return 0
 
 

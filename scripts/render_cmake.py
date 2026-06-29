@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import pathlib
 from typing import Any
 
 from common import atomic_write_text, ensure_state, load_json, rel, resolve_root
@@ -21,12 +22,18 @@ def load_irs(state) -> list[dict[str, Any]]:
     return [load_json(path) for path in sorted((state / "files").glob("*.ir.json"))]
 
 
+def load_model_results(state) -> list[dict[str, Any]]:
+    return [load_json(path) for path in sorted((state / "model_results").glob("*.model.json"))]
+
+
 def render_report(state, root) -> str:
     products = load_json(state / "products.json", {"products": []})
     mk_files = load_json(state / "mk_files.json", {"files": []})
     graph = load_json(state / "include_graph.json", {"edges": [], "unresolved": []})
     generated = load_json(state / "generated_manifest.json", {"files": []})
+    graph_run = load_json(state / "graph_run.json", {"stage_results": []})
     irs = load_irs(state)
+    model_results = load_model_results(state)
 
     target_rows = [["Source", "Module", "CMake target", "Kind", "Layer"]]
     layer_rows = [["LOCAL_MODULE", "CMake object target", "LOCAL_LAYER", "处理方式"]]
@@ -71,12 +78,42 @@ def render_report(state, root) -> str:
     for item in generated.get("files", []):
         generated_rows.append([item.get("source", ""), item.get("output", "")])
 
+    graph_rows = [["Stage", "Status", "Reused", "Summary"]]
+    for item in graph_run.get("stage_results", []):
+        summary = ", ".join(
+            f"{key}={value}"
+            for key, value in item.items()
+            if key not in {"stage", "status", "reused", "output"} and isinstance(value, (str, int, bool))
+        )
+        graph_rows.append([item.get("stage", ""), item.get("status", ""), str(item.get("reused", "")), summary])
+
+    ai_rows = [["Source", "Tasks", "Converted", "Failed", "Skipped", "Cache hits"]]
+    for item in model_results:
+        tasks = item.get("tasks", [])
+        ai_rows.append(
+            [
+                item.get("source_file", ""),
+                str(len(tasks)),
+                str(sum(1 for task in tasks if task.get("result", {}).get("status") == "converted")),
+                str(sum(1 for task in tasks if task.get("result", {}).get("status") == "failed")),
+                str(sum(1 for task in tasks if task.get("result", {}).get("status") == "skipped")),
+                str(sum(1 for task in tasks if task.get("cache_hit"))),
+            ]
+        )
+
     unresolved_lines = []
     for ir in irs:
         for item in ir.get("unknown", []):
             unresolved_lines.append(f"- {ir['source_file']}:{item.get('line')} {item.get('reason')}")
     for edge in graph.get("unresolved", []):
         unresolved_lines.append(f"- {edge.get('from')}:{edge.get('line')} unresolved include `{edge.get('expr')}`")
+    for result in model_results:
+        for task in result.get("tasks", []):
+            status = task.get("result", {}).get("status")
+            if status == "converted":
+                continue
+            risks = "; ".join(task.get("result", {}).get("risks", []))
+            unresolved_lines.append(f"- {result.get('source_file')}:{task.get('line')} ai {status}: {risks}")
 
     return "\n".join(
         [
@@ -110,6 +147,14 @@ def render_report(state, root) -> str:
             "",
             table(generated_rows),
             "",
+            "## LangGraph 执行摘要",
+            "",
+            table(graph_rows) if len(graph_rows) > 1 else "_Not run through LangGraph._",
+            "",
+            "## AI fallback 摘要",
+            "",
+            table(ai_rows) if len(ai_rows) > 1 else "_No AI fallback result files._",
+            "",
             "## 未解析项",
             "",
             "\n".join(unresolved_lines) if unresolved_lines else "_None_",
@@ -126,16 +171,21 @@ def render_report(state, root) -> str:
     ) + "\n"
 
 
+def render_cmake_stage(root: str | pathlib.Path = ".", state_dir: str = "state") -> dict[str, Any]:
+    root = resolve_root(root)
+    state = ensure_state(root, state_dir)
+    output = state / "report.md"
+    atomic_write_text(output, render_report(state, root))
+    return {"stage": "render_cmake", "status": "done", "output": rel(output, root)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Render migration report from generated state.")
     parser.add_argument("--root", default=".")
     parser.add_argument("--state-dir", default="state")
     args = parser.parse_args()
-    root = resolve_root(args.root)
-    state = ensure_state(root, args.state_dir)
-    output = state / "report.md"
-    atomic_write_text(output, render_report(state, root))
-    print(f"render_cmake: wrote {rel(output, root)}")
+    result = render_cmake_stage(args.root, args.state_dir)
+    print(f"render_cmake: wrote {result['output']}")
     return 0
 
 

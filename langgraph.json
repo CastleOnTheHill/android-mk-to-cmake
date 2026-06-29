@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "mk2cmake": "./scripts/graph_workflow.py:mk2cmake_graph"
+  }
+}

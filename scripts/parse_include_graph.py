@@ -127,23 +127,28 @@ def parse_file(root: pathlib.Path, source_rel: str) -> list[dict[str, Any]]:
     return edges
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Build mk include graph before conversion.")
-    parser.add_argument("--root", default=".")
-    parser.add_argument("--state-dir", default="state")
-    parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
-
-    root = resolve_root(args.root)
-    state = ensure_state(root, args.state_dir)
+def parse_include_graph_stage(
+    root: str | pathlib.Path = ".",
+    state_dir: str = "state",
+    force: bool = False,
+) -> dict[str, Any]:
+    root = resolve_root(root)
+    state = ensure_state(root, state_dir)
     mk_files_path = state / "mk_files.json"
     output = state / "include_graph.json"
     manifest = Manifest(root, state)
     mk_files = load_json(mk_files_path, {"files": []})["files"]
     digest = input_hash([f"{item['path']}:{item['sha256']}" for item in mk_files])
-    if not args.force and manifest.done("parse_include_graph", "all", digest, [output]):
-        print(f"parse_include_graph: reused {rel(output, root)}")
-        return 0
+    if not force and manifest.done("parse_include_graph", "all", digest, [output]):
+        graph = load_json(output, {"edges": [], "unresolved": []})
+        return {
+            "stage": "parse_include_graph",
+            "status": "done",
+            "reused": True,
+            "edges": len(graph.get("edges", [])),
+            "unresolved_required": len(graph.get("unresolved", [])),
+            "output": rel(output, root),
+        }
 
     edges: list[dict[str, Any]] = []
     nodes = [{"id": item["id"], "path": item["path"], "kind_guess": item["kind_guess"]} for item in mk_files]
@@ -158,7 +163,28 @@ def main() -> int:
     }
     atomic_write_json(output, result)
     manifest.mark("parse_include_graph", "all", "done", digest, [output])
-    print(f"parse_include_graph: {len(edges)} include edge(s), {len(unresolved)} unresolved required")
+    return {
+        "stage": "parse_include_graph",
+        "status": "done",
+        "reused": False,
+        "edges": len(edges),
+        "unresolved_required": len(unresolved),
+        "output": rel(output, root),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build mk include graph before conversion.")
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--state-dir", default="state")
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args()
+
+    result = parse_include_graph_stage(args.root, args.state_dir, args.force)
+    if result["reused"]:
+        print(f"parse_include_graph: reused {result['output']}")
+    else:
+        print(f"parse_include_graph: {result['edges']} include edge(s), {result['unresolved_required']} unresolved required")
     return 0
 
 

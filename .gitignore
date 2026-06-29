@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 build/
 cmake-build/
+.opencode/node_modules/
+.opencode/package-lock.json

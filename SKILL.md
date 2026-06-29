@@ -1,6 +1,6 @@
 ---
 name: android-mk-to-cmake
-description: Convert Android.mk, package.mk, and Makefile projects to CMake using script-first parsing, Kconfig .config awareness, include graph resolution, resumable state, and small model fallback only for unknown Makefile blocks.
+description: Convert Android.mk, package.mk, and Makefile projects to CMake using LangGraph orchestration, script-first parsing, Kconfig .config awareness, include graph resolution, resumable state, and small cached model fallback only for unknown Makefile blocks.
 ---
 
 # Android MK to CMake
@@ -9,7 +9,7 @@ Use this skill when converting complete `Android.mk`, `package.mk`, or `Makefile
 
 ## Workflow
 
-Run the scripts first. Do not manually rewrite a long mk file directly.
+Run the LangGraph workflow first. Do not manually rewrite a long mk file directly.
 
 ```sh
 python3 android-mk-to-cmake/scripts/run_all.py --root . --config-dir config
@@ -17,10 +17,20 @@ python3 android-mk-to-cmake/scripts/run_all.py --root . --config-dir config
 
 If the project does not use a `config/` directory, omit `--config-dir`.
 
+For Studio monitoring, use Python 3.11+:
+
+```sh
+cd android-mk-to-cmake
+pip install -e .
+langgraph dev
+```
+
 ## Rules
 
 - Prefer script output over model output.
 - Use model assistance only for files in `state/unknown/`.
+- Do not use an agent as the scheduler. LangGraph owns stage scheduling and monitoring.
+- AI fallback uses `opencode` by default and must return JSON. Cache and normalize AI output before merging.
 - Keep generated CMake close to the original mk statement order for review.
 - Preserve `ifeq` / `ifneq` / `ifdef` / `ifndef` / `else` / `endif` structure. Do not merge or reorder conditions.
 - Resolve mk include relationships before conversion. Convert each mk file independently after the include graph exists.

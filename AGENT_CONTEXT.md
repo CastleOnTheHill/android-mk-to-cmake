@@ -6,6 +6,8 @@ Build a script-first conversion system for complete `Android.mk`, `package.mk`, 
 
 The system is designed for weak or constrained LLMs: scripts do as much deterministic parsing and conversion as possible, and model calls are reserved only for small unresolved blocks.
 
+The main workflow is now orchestrated by LangGraph. Agents should not act as the task scheduler. LangGraph schedules deterministic script stages and the small AI fallback stage, records stage summaries, and can be inspected with LangGraph Studio.
+
 This is not a simple snippet replacement tool. It aims to convert full mk-based build descriptions into reviewable CMake output.
 
 ## Design Principles
@@ -17,9 +19,11 @@ This is not a simple snippet replacement tool. It aims to convert full mk-based 
 - Preserve `ifeq` / `ifneq` / `ifdef` / `ifndef` / `else` / `endif` structure. Do not merge, simplify, or reorder conditions.
 - Make generated CMake easy to review by keeping `# from <file>:<line> <raw mk statement>` comments.
 - Support long-running task recovery with content hashes and `state/manifest.json`.
+- Use LangGraph for workflow scheduling and monitoring; keep deterministic work in Python stages.
 - Treat Kconfig `.config` files as product configuration inputs.
 - Do not use build logs in v1.
-- Do not hide unresolved cases. Write unknown blocks and skipped model fallback results explicitly.
+- Do not hide unresolved cases. Write unknown blocks and skipped or failed model fallback results explicitly.
+- AI fallback must be hash-cached, JSON schema checked, and canonicalized before generated CMake uses it.
 
 ## Current Pipeline
 
@@ -47,14 +51,28 @@ Pipeline order:
    - parses each mk file into order-preserving IR
    - writes `state/files/*.ir.json` and `state/unknown/*.unknown.json`
 5. `ask_model_for_unknown.py`
-   - currently records `SKIPPED` model fallback results because no model backend is configured
+   - processes only `state/unknown/*.unknown.json`
+   - default backend is `opencode run --agent mk2cmake-unknown --model minimax/minimax2.7 --format json`
+   - writes cache entries under `state/ai_cache/`
    - writes `state/model_results/*.model.json`
 6. `convert_ir.py`
-   - converts IR to CMake under `state/generated/`
+   - converts IR and accepted AI fallback fragments to CMake under `state/generated/`
 7. `render_cmake.py`
-   - writes `state/report.md`
+   - writes `state/report.md`, including LangGraph and AI fallback summaries
 8. `check_cmake.py`
    - runs a conservative CMake configure check when possible
+
+LangGraph entry:
+
+```sh
+cd android-mk-to-cmake
+python3.11 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+langgraph dev
+```
+
+The graph is configured in `langgraph.json` as `mk2cmake`.
 
 ## IR Meaning
 
@@ -142,16 +160,21 @@ Each script should:
 - write outputs atomically
 - support `--force`
 
-`run_all.py` simply re-runs all stages. Individual stages decide what can be reused.
+`run_all.py` invokes the LangGraph workflow when the optional dependencies are available. If LangGraph is not installed, it falls back to running the same imported stage functions in order for local compatibility.
+
+LangGraph checkpoints are for workflow-level recovery and Studio visibility. The durable source of conversion reuse remains `state/manifest.json` plus `state/ai_cache/`.
+
+AI cache keys include the unknown task JSON, provider, model, agent, and prompt version. Re-running the same unresolved fragment should reuse the normalized cached result instead of asking the model again.
 
 ## Current Limitations
 
-- No real model backend is wired yet. `ask_model_for_unknown.py` writes explicit skipped results.
+- AI fallback assumes `opencode` is available on `PATH` in the target environment. Use `--ai-provider skipped` when running without opencode.
 - Ordinary non-Android Makefile recipe conversion is not implemented beyond preserving unknowns.
 - Complex make functions are not expanded unless explicitly handled by the parser.
 - Include resolution handles common literal and `$(LOCAL_PATH)` cases, but variable-heavy include paths may remain unresolved.
 - Generated CMake is emitted under `state/generated/`; it is not copied back into the source tree.
 - CMake configure check only runs when a root generated `CMakeLists.txt` exists.
+- LangGraph Studio requires Python 3.11+. The compatibility fallback keeps basic CLI tests usable on Python 3.10.
 
 ## Validation
 
@@ -167,6 +190,8 @@ Current test coverage verifies:
 - `LOCAL_LAYER + BUILD_STATIC_LIBRARY` -> object library
 - condition structure preservation
 - generated source-line comments
+- AI unknown cache and canonical fragment normalization
+- accepted AI fragments being merged while failed fragments stay out of generated CMake
 - report generation
 - `run_all.py` resume path
 
@@ -174,6 +199,5 @@ Current test coverage verifies:
 
 - Add more real-world Android.mk examples.
 - Improve make function expansion in `parse_mk.py`.
-- Add a configurable model backend for `state/unknown/*.unknown.json`.
 - Add copying/install mode for promoting `state/generated/` into the project tree.
 - Add graph-aware invalidation for include-dependent files.

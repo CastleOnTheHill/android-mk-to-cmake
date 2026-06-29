@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import pathlib
+from typing import Any
 
 from common import Manifest, atomic_write_json, ensure_state, input_hash, rel, resolve_root, resolve_under, sha256_file, stable_id
 
@@ -32,25 +33,23 @@ def kind_guess(path: pathlib.Path) -> str:
     return "mk"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Scan project for Android.mk, package.mk, *.mk, and Makefile inputs.")
-    parser.add_argument("--root", default=".")
-    parser.add_argument("--scan-dir", default=".")
-    parser.add_argument("--state-dir", default="state")
-    parser.add_argument("--pattern", action="append", default=[])
-    parser.add_argument("--ignore", action="append", default=[])
-    parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
-
-    root = resolve_root(args.root)
-    scan_dir = resolve_under(root, args.scan_dir)
-    state = ensure_state(root, args.state_dir)
+def scan_mk_stage(
+    root: str | pathlib.Path = ".",
+    scan_dir: str = ".",
+    state_dir: str = "state",
+    patterns: list[str] | None = None,
+    extra_ignores: list[str] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    root = resolve_root(root)
+    scan_path = resolve_under(root, scan_dir)
+    state = ensure_state(root, state_dir)
     output = state / "mk_files.json"
     manifest = Manifest(root, state)
-    patterns = args.pattern or DEFAULT_PATTERNS
-    ignores = DEFAULT_IGNORES + args.ignore + [rel(state, root)]
+    patterns = patterns or DEFAULT_PATTERNS
+    ignores = DEFAULT_IGNORES + (extra_ignores or []) + [rel(state, root)]
 
-    candidates = sorted(path for path in scan_dir.rglob("*") if path.is_file())
+    candidates = sorted(path for path in scan_path.rglob("*") if path.is_file())
     files = []
     for path in candidates:
         if ignored(path, root, ignores) or not matches(path, patterns):
@@ -69,14 +68,30 @@ def main() -> int:
             }
         )
 
-    digest = input_hash([rel(scan_dir, root), *[f"{item['path']}:{item['sha256']}" for item in files]])
-    if not args.force and manifest.done("scan_mk", "all", digest, [output]):
-        print(f"scan_mk: reused {rel(output, root)}")
-        return 0
+    digest = input_hash([rel(scan_path, root), *[f"{item['path']}:{item['sha256']}" for item in files]])
+    if not force and manifest.done("scan_mk", "all", digest, [output]):
+        return {"stage": "scan_mk", "status": "done", "reused": True, "files": len(files), "output": rel(output, root)}
 
     atomic_write_json(output, {"schema_version": 1, "root": rel(root, root), "files": files})
     manifest.mark("scan_mk", "all", "done", digest, [output])
-    print(f"scan_mk: discovered {len(files)} mk/make file(s)")
+    return {"stage": "scan_mk", "status": "done", "reused": False, "files": len(files), "output": rel(output, root)}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Scan project for Android.mk, package.mk, *.mk, and Makefile inputs.")
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--scan-dir", default=".")
+    parser.add_argument("--state-dir", default="state")
+    parser.add_argument("--pattern", action="append", default=[])
+    parser.add_argument("--ignore", action="append", default=[])
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args()
+
+    result = scan_mk_stage(args.root, args.scan_dir, args.state_dir, args.pattern or None, args.ignore, args.force)
+    if result["reused"]:
+        print(f"scan_mk: reused {result['output']}")
+    else:
+        print(f"scan_mk: discovered {result['files']} mk/make file(s)")
     return 0
 
 

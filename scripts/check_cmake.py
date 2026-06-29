@@ -27,42 +27,37 @@ def append_check_result(report: pathlib.Path, text: str) -> None:
         atomic_write_text(report, existing.rstrip() + "\n\n" + marker + "\n\n" + text.rstrip() + "\n")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a conservative CMake syntax/configuration check.")
-    parser.add_argument("--root", default=".")
-    parser.add_argument("--state-dir", default="state")
-    parser.add_argument("--source-dir", default="")
-    args = parser.parse_args()
-
-    root = resolve_root(args.root)
-    state = ensure_state(root, args.state_dir)
+def check_cmake_stage(
+    root: str | pathlib.Path = ".",
+    state_dir: str = "state",
+    source_dir: str = "",
+) -> dict[str, str | int]:
+    root = resolve_root(root)
+    state = ensure_state(root, state_dir)
     report = state / "report.md"
     cmake = shutil.which("cmake")
     if not cmake:
         append_check_result(report, "SKIPPED: `cmake` command not found.")
-        print("check_cmake: SKIPPED cmake not found")
-        return 0
+        return {"stage": "check_cmake", "status": "skipped", "reason": "cmake not found", "returncode": 0}
 
-    source_dir = resolve_under(root, args.source_dir) if args.source_dir else state / "generated"
-    if not (source_dir / "CMakeLists.txt").exists():
-        append_check_result(report, f"SKIPPED: no root CMakeLists.txt found at `{rel(source_dir, root)}`.")
-        print("check_cmake: SKIPPED no root CMakeLists.txt")
-        return 0
+    source_path = resolve_under(root, source_dir) if source_dir else state / "generated"
+    if not (source_path / "CMakeLists.txt").exists():
+        append_check_result(report, f"SKIPPED: no root CMakeLists.txt found at `{rel(source_path, root)}`.")
+        return {"stage": "check_cmake", "status": "skipped", "reason": "no root CMakeLists.txt", "returncode": 0}
 
     build_dir = state / "cmake-check"
-    cp = run([cmake, "-S", str(source_dir), "-B", str(build_dir)], root)
+    cp = run([cmake, "-S", str(source_path), "-B", str(build_dir)], root)
     log = (state / "logs" / "cmake-check.log")
     log.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(log, cp.stdout + "\n" + cp.stderr)
     if cp.returncode == 0:
-        append_check_result(report, f"PASS: `cmake -S {rel(source_dir, root)} -B {rel(build_dir, root)}` succeeded.")
-        print("check_cmake: PASS")
-        return 0
+        append_check_result(report, f"PASS: `cmake -S {rel(source_path, root)} -B {rel(build_dir, root)}` succeeded.")
+        return {"stage": "check_cmake", "status": "pass", "returncode": 0, "log": rel(log, root)}
     append_check_result(
         report,
         "\n".join(
             [
-                f"FAIL: `cmake -S {rel(source_dir, root)} -B {rel(build_dir, root)}` failed.",
+                f"FAIL: `cmake -S {rel(source_path, root)} -B {rel(build_dir, root)}` failed.",
                 "",
                 f"Log: `{rel(log, root)}`",
                 "",
@@ -70,8 +65,25 @@ def main() -> int:
             ]
         ),
     )
+    return {"stage": "check_cmake", "status": "fail", "returncode": cp.returncode, "log": rel(log, root)}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run a conservative CMake syntax/configuration check.")
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--state-dir", default="state")
+    parser.add_argument("--source-dir", default="")
+    args = parser.parse_args()
+
+    result = check_cmake_stage(args.root, args.state_dir, args.source_dir)
+    if result["status"] == "skipped":
+        print(f"check_cmake: SKIPPED {result['reason']}")
+        return 0
+    if result["status"] == "pass":
+        print("check_cmake: PASS")
+        return 0
     print("check_cmake: FAIL")
-    return 1
+    return int(result["returncode"])
 
 
 if __name__ == "__main__":

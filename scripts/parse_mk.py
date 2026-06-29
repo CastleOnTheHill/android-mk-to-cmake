@@ -250,6 +250,51 @@ def parse_file(root: pathlib.Path, source_rel: str) -> dict[str, Any]:
     return result
 
 
+def parse_mk_stage(
+    root: str | pathlib.Path = ".",
+    state_dir: str = "state",
+    files: list[str] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    root = resolve_root(root)
+    state = ensure_state(root, state_dir)
+    manifest = Manifest(root, state)
+    mk_files = load_json(state / "mk_files.json", {"files": []})["files"]
+    wanted = set(files or [])
+    selected = [item for item in mk_files if not wanted or item["path"] in wanted]
+    out_dir = state / "files"
+    unknown_dir = state / "unknown"
+    count = 0
+    unknown_count = 0
+    reused = 0
+
+    for item in selected:
+        source = root / item["path"]
+        output = out_dir / f"{item['id']}.ir.json"
+        unknown_output = unknown_dir / f"{item['id']}.unknown.json"
+        digest = input_hash([item["path"], sha256_file(source)])
+        if not force and manifest.done("parse_mk", item["id"], digest, [output, unknown_output]):
+            task = load_json(unknown_output, {"items": []})
+            count += 1
+            reused += 1
+            unknown_count += len(task.get("items", []))
+            continue
+        ir = parse_file(root, item["path"])
+        atomic_write_json(output, ir)
+        atomic_write_json(unknown_output, {"schema_version": 1, "source_file": item["path"], "items": ir["unknown"]})
+        manifest.mark("parse_mk", item["id"], "done", digest, [output, unknown_output])
+        count += 1
+        unknown_count += len(ir["unknown"])
+    return {
+        "stage": "parse_mk",
+        "status": "done",
+        "reused": reused == count and count > 0,
+        "files": count,
+        "reused_files": reused,
+        "unknown_items": unknown_count,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Parse each mk file into order-preserving IR.")
     parser.add_argument("--root", default=".")
@@ -258,32 +303,8 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    root = resolve_root(args.root)
-    state = ensure_state(root, args.state_dir)
-    manifest = Manifest(root, state)
-    mk_files = load_json(state / "mk_files.json", {"files": []})["files"]
-    wanted = set(args.file)
-    selected = [item for item in mk_files if not wanted or item["path"] in wanted]
-    out_dir = state / "files"
-    unknown_dir = state / "unknown"
-    count = 0
-    unknown_count = 0
-
-    for item in selected:
-        source = root / item["path"]
-        output = out_dir / f"{item['id']}.ir.json"
-        unknown_output = unknown_dir / f"{item['id']}.unknown.json"
-        digest = input_hash([item["path"], sha256_file(source)])
-        if not args.force and manifest.done("parse_mk", item["id"], digest, [output, unknown_output]):
-            count += 1
-            continue
-        ir = parse_file(root, item["path"])
-        atomic_write_json(output, ir)
-        atomic_write_json(unknown_output, {"schema_version": 1, "source_file": item["path"], "items": ir["unknown"]})
-        manifest.mark("parse_mk", item["id"], "done", digest, [output, unknown_output])
-        count += 1
-        unknown_count += len(ir["unknown"])
-    print(f"parse_mk: parsed {count} file(s), {unknown_count} unknown item(s)")
+    result = parse_mk_stage(args.root, args.state_dir, args.file, args.force)
+    print(f"parse_mk: parsed {result['files']} file(s), {result['unknown_items']} unknown item(s)")
     return 0
 
 
