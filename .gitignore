@@ -2,6 +2,8 @@ state/
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
+.langgraph_api/
 build/
 cmake-build/
 .opencode/node_modules/

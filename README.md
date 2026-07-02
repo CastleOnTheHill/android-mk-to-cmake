@@ -6,6 +6,8 @@ The design goal is to keep most conversion deterministic and reviewable. Python 
 
 ## Quick Start
 
+See [`OPERATING_GUIDE.md`](OPERATING_GUIDE.md) for the full operation guide, including LangGraph monitoring, the lightweight DAG executor, libcurl validation, and opencode failure behavior.
+
 ```sh
 python3 android-mk-to-cmake/scripts/run_all.py --root . --config-dir config
 ```

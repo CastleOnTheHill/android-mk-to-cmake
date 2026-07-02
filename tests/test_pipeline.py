@@ -29,6 +29,36 @@ def run_script(name: str, root: pathlib.Path, *extra: str) -> subprocess.Complet
 
 
 class PipelineTest(unittest.TestCase):
+    def write_ai_failure_fixture(self, root: pathlib.Path) -> pathlib.Path:
+        state = root / "state"
+        (state / "unknown").mkdir(parents=True)
+        (state / "files").mkdir(parents=True)
+        unknown = {
+            "schema_version": 1,
+            "source_file": "device/example/Android.mk",
+            "items": [
+                {
+                    "line": 7,
+                    "end_line": 7,
+                    "reason": "unparsed_statement",
+                    "raw": "$(call custom-rule,foo)",
+                    "condition_stack": [],
+                }
+            ],
+        }
+        ir = {
+            "schema_version": 1,
+            "source_file": "device/example/Android.mk",
+            "source_sha256": "source",
+            "file_type": "connector",
+            "events": [],
+            "targets": [],
+            "unknown": unknown["items"],
+        }
+        (state / "unknown" / "abc.unknown.json").write_text(json.dumps(unknown), encoding="utf-8")
+        (state / "files" / "abc.ir.json").write_text(json.dumps(ir), encoding="utf-8")
+        return state
+
     def test_kconfig_local_layer_and_condition_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -222,6 +252,44 @@ class PipelineTest(unittest.TestCase):
                     "risks": [],
                 }
             )
+
+    def test_opencode_failures_do_not_break_conversion(self) -> None:
+        cases = {
+            "error": lambda task, prompt, run_root: (_ for _ in ()).throw(RuntimeError("opencode exited with 1")),
+            "timeout": lambda task, prompt, run_root: (_ for _ in ()).throw(subprocess.TimeoutExpired(["opencode"], timeout=1)),
+            "bad_result": lambda task, prompt, run_root: {
+                "schema_version": 1,
+                "status": "converted",
+                "confidence": "high",
+                "cmake_fragment": "```cmake\nmessage(STATUS bad)\n```",
+                "ir_events": [],
+                "risks": [],
+            },
+        }
+        for name, runner in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                state = self.write_ai_failure_fixture(root)
+
+                ai_result = ai_unknown_stage(root, provider="opencode", runner=runner)
+                self.assertEqual(ai_result["status"], "done")
+                self.assertEqual(ai_result["tasks"], 1)
+                self.assertEqual(ai_result["converted"], 0)
+                self.assertEqual(ai_result["failed"], 1)
+
+                model = json.loads((state / "model_results" / "abc.model.json").read_text(encoding="utf-8"))
+                task_result = model["tasks"][0]["result"]
+                self.assertEqual(task_result["status"], "failed")
+                self.assertEqual(task_result["cmake_fragment"], "")
+                self.assertTrue(task_result["risks"])
+
+                convert_result = convert_ir_stage(root)
+                self.assertEqual(convert_result["status"], "done")
+                self.assertEqual(convert_result["ai_fragments"], 0)
+                cmake = (state / "generated" / "device" / "example" / "CMakeLists.txt").read_text(encoding="utf-8")
+                self.assertIn("# connector from device/example/Android.mk", cmake)
+                self.assertNotIn("AI fallback fragments", cmake)
+                self.assertNotIn("message(STATUS bad)", cmake)
 
 
 if __name__ == "__main__":

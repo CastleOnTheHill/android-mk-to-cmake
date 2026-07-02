@@ -21,7 +21,6 @@ from render_cmake import render_cmake_stage
 from scan_mk import scan_mk_stage
 
 try:
-    from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import END, START, StateGraph
 except ImportError as exc:  # pragma: no cover - exercised only without optional dependency
     raise RuntimeError("LangGraph workflow requires Python 3.11+ and the langgraph dependencies from pyproject.toml") from exc
@@ -155,7 +154,7 @@ def build_graph():
     graph.add_edge("record_graph_run", "render_report")
     graph.add_conditional_edges("render_report", route_after_report, {"check_cmake": "check_cmake", "end": END})
     graph.add_edge("check_cmake", END)
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile()
 
 
 mk2cmake_graph = build_graph()
