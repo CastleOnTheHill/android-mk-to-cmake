@@ -41,7 +41,9 @@ class LiteDagTest(unittest.TestCase):
             "\n".join(
                 [
                     "include Makefile.inc",
+                    "include $(generated_include)",
                     "lib_LTLIBRARIES = libcurl.la",
+                    "stamp-custom:",
                     "noinst_LTLIBRARIES = libcurlu.la",
                     "libcurl_la_SOURCES = $(CSOURCES) $(HHEADERS) $(libcurl_gen)",
                     "libcurlu_la_SOURCES = $(CSOURCES) $(HHEADERS)",
@@ -120,6 +122,17 @@ class LiteDagTest(unittest.TestCase):
             self.assertIn("${MK_SOURCE_ROOT}/lib/a.c", generated)
             self.assertIn("${MK_SOURCE_ROOT}/lib/a.h", generated)
             self.assertNotIn("generated.c", generated)
+
+            self.assertIn("unknown Makefile fragment (dynamic_include) from lib/Makefile.am:2", generated)
+            self.assertIn("#   include $(generated_include)", generated)
+            self.assertIn("unknown Makefile fragment (recipe_or_rule) from lib/Makefile.am:4", generated)
+            self.assertIn("#   stamp-custom:", generated)
+            self.assertLess(generated.index("dynamic_include"), generated.index("add_library(libcurl STATIC)"))
+            self.assertLess(generated.index("add_library(libcurl STATIC)"), generated.index("stamp-custom:"))
+            self.assertLess(generated.index("stamp-custom:"), generated.index("add_library(libcurlu STATIC)"))
+
+            convert_task = next(item for item in graph_run["tasks"] if item["name"] == "convert_makefiles")
+            self.assertEqual(convert_task["unknown_comments"], 2)
 
 
 if __name__ == "__main__":

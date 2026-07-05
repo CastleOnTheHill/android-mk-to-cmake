@@ -9,6 +9,7 @@ It uses only Python standard library code:
 - `state/dashboard.html`
 - small Automake `Makefile.am` / `Makefile.inc` parsing
 - generated CMake under `state/generated/`
+- ordered TODO comments for unknown Makefile fragments in generated `CMakeLists.txt`
 - comparison against an existing CMake build description
 - configuration switch coverage in `state/config_switches.json`
 

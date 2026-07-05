@@ -181,6 +181,7 @@ def normalize_source(base_dir: str, value: str) -> str:
 class Assignment:
     file: str
     line: int
+    seq: int
     variable: str
     operator: str
     values: list[str]
@@ -208,8 +209,10 @@ class MakefileParser:
 
     def __init__(self, root: pathlib.Path):
         self.root = root.resolve()
+        self._sequence = 0
 
     def parse(self, rel_path: str) -> MakefileIR:
+        self._sequence = 0
         path = self.root / rel_path
         ir = MakefileIR(path=rel_path, directory=path.parent.relative_to(self.root).as_posix())
         self._parse_into(ir, path, [])
@@ -217,9 +220,20 @@ class MakefileParser:
         ir.targets = self._build_targets(ir)
         return ir
 
+    def _next_sequence(self) -> int:
+        self._sequence += 1
+        return self._sequence
+
+    def _unknown(self, path: pathlib.Path, row: dict[str, Any] | None, seq: int, reason: str, **extra: Any) -> dict[str, Any]:
+        item: dict[str, Any] = {"file": rel(path, self.root), "seq": seq, "reason": reason}
+        if row:
+            item.update({"line": row["line"], "end_line": row["end_line"], "raw": row["raw"], "text": row["text"]})
+        item.update(extra)
+        return item
+
     def _parse_into(self, ir: MakefileIR, path: pathlib.Path, include_stack: list[pathlib.Path]) -> None:
         if path in include_stack:
-            ir.unknown.append({"file": rel(path, self.root), "reason": "include_cycle"})
+            ir.unknown.append(self._unknown(path, None, self._next_sequence(), "include_cycle"))
             return
         include_stack = [*include_stack, path]
         condition_stack: list[dict[str, Any]] = []
@@ -227,10 +241,11 @@ class MakefileParser:
             text = strip_comment(row["text"]).strip()
             if not text:
                 continue
+            seq = self._next_sequence()
             if text.startswith("if ") or re.match(r"^if[A-Z0-9_]+\b", text):
                 expr = text[3:].strip() if text.startswith("if ") else text[2:].strip()
                 switch = condition_switch(expr)
-                ir.conditions.append({"file": rel(path, self.root), "line": row["line"], "raw": text, "expr": expr, "switch": switch})
+                ir.conditions.append({"file": rel(path, self.root), "line": row["line"], "seq": seq, "raw": text, "expr": expr, "switch": switch})
                 condition_stack.append({"raw": text, "expr": expr, "switch": switch, "active": condition_default(expr), "negated": False})
                 continue
             if text == "else":
@@ -243,37 +258,38 @@ class MakefileParser:
                         "negated": not bool(current.get("negated")),
                     }
                 else:
-                    ir.unknown.append({"file": rel(path, self.root), "line": row["line"], "reason": "else_without_if"})
+                    ir.unknown.append(self._unknown(path, row, seq, "else_without_if"))
                 continue
             if text == "endif":
                 if condition_stack:
                     condition_stack.pop()
                 else:
-                    ir.unknown.append({"file": rel(path, self.root), "line": row["line"], "reason": "endif_without_if"})
+                    ir.unknown.append(self._unknown(path, row, seq, "endif_without_if"))
                 continue
             include = self.include_re.match(text)
             if include:
                 include_value = include.group("path").strip().strip('"')
                 if "$" in include_value:
-                    ir.unknown.append({"file": rel(path, self.root), "line": row["line"], "reason": "dynamic_include", "expr": include_value})
+                    ir.unknown.append(self._unknown(path, row, seq, "dynamic_include", expr=include_value))
                     continue
                 include_path = (path.parent / include_value).resolve()
                 if include_path.exists():
                     ir.included_files.append(rel(include_path, self.root))
                     self._parse_into(ir, include_path, include_stack)
                 else:
-                    ir.unknown.append({"file": rel(path, self.root), "line": row["line"], "reason": "missing_include", "expr": include_value})
+                    ir.unknown.append(self._unknown(path, row, seq, "missing_include", expr=include_value))
                 continue
             match = self.assign_re.match(text)
             if not match:
                 if ":" in text or text.startswith("\t"):
-                    ir.unknown.append({"file": rel(path, self.root), "line": row["line"], "reason": "recipe_or_rule", "text": text[:120]})
+                    ir.unknown.append(self._unknown(path, row, seq, "recipe_or_rule", text=text[:120]))
                 continue
             active = all(bool(item["active"]) for item in condition_stack)
             ir.assignments.append(
                 Assignment(
                     file=rel(path, self.root),
                     line=row["line"],
+                    seq=seq,
                     variable=match.group("var"),
                     operator=match.group("op"),
                     values=split_words(match.group("value")),
@@ -377,6 +393,7 @@ class MakefileParser:
                         "kind": target_kind(container),
                         "container": container,
                         "directory": ir.directory,
+                        "seq": self._target_sequence(ir, container, raw_target, target_var),
                         "sources": sources,
                         "generated_sources": generated_sources,
                         "include_dirs": sorted(dict.fromkeys(include_dirs)),
@@ -386,6 +403,27 @@ class MakefileParser:
                     }
                 )
         return targets
+
+    def _target_sequence(self, ir: MakefileIR, container: str, raw_target: str, target_var: str) -> int:
+        container_seqs = [
+            item.seq
+            for item in ir.assignments
+            if item.active
+            and item.variable == container
+            and raw_target in self.expand_values(item.values, ir.variables)
+        ]
+        if container_seqs:
+            return min(container_seqs)
+        related_vars = {
+            container,
+            f"{target_var}_SOURCES",
+            f"nodist_{target_var}_SOURCES",
+            "AM_CPPFLAGS",
+            f"{target_var}_CPPFLAGS",
+            f"{target_var}_LDADD",
+        }
+        related_seqs = [item.seq for item in ir.assignments if item.active and item.variable in related_vars]
+        return min(related_seqs) if related_seqs else 0
 
     def _normalize_include(self, directory: str, value: str) -> str:
         value = value.strip('"')
@@ -533,6 +571,21 @@ def render_target(target: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_unknown_fragment(fragment: dict[str, Any]) -> str:
+    reason = fragment.get("reason", "unknown")
+    file = fragment.get("file", "?")
+    line = fragment.get("line")
+    location = f"{file}:{line}" if line else file
+    lines = [f"# TODO(ai/manual): convert unknown Makefile fragment ({reason}) from {location}."]
+    expr = fragment.get("expr")
+    if expr:
+        lines.append(f"# expr: {expr}")
+    raw = fragment.get("raw") or fragment.get("text") or ""
+    for raw_line in raw.splitlines():
+        lines.append(f"#   {raw_line}")
+    return "\n".join(lines) + "\n"
+
+
 def make_switches_from_ir(files: list[dict[str, Any]]) -> list[str]:
     switches = set()
     for file_ir in files:
@@ -600,18 +653,28 @@ def convert_makefiles(ctx: dict[str, Any]) -> dict[str, Any]:
     switches = make_switches_from_ir(data["files"])
     write_text(output_root / "MakefileSwitches.cmake", render_switch_compat(switches))
     manifest = []
+    unknown_count = 0
     for item in data["files"]:
-        if item["targets"]:
+        if item["targets"] or item.get("unknown"):
             root_lines.append(f"add_subdirectory({item['directory']})")
         out = output_root / item["directory"] / "CMakeLists.txt"
         body = ["# Generated by lite_dag/run.py.", "# Review before using as production CMake.", ""]
-        for target in item["targets"]:
-            body.append(render_target(target))
-            manifest.append({"directory": item["directory"], **target})
+        events: list[tuple[int, int, str, dict[str, Any]]] = []
+        for index, target in enumerate(item["targets"]):
+            events.append((int(target.get("seq", 0)), index, "target", target))
+        for index, fragment in enumerate(item.get("unknown", [])):
+            unknown_count += 1
+            events.append((int(fragment.get("seq", 0)), index, "unknown", fragment))
+        for _seq, _index, kind, payload in sorted(events, key=lambda event: (event[0], event[1], event[2])):
+            if kind == "target":
+                body.append(render_target(payload))
+                manifest.append({"directory": item["directory"], **payload})
+            else:
+                body.append(render_unknown_fragment(payload))
         write_text(out, "\n".join(body).rstrip() + "\n")
     write_text(output_root / "CMakeLists.txt", "\n".join(root_lines).rstrip() + "\n")
     write_json(ctx["state_dir"] / "generated_manifest.json", {"schema_version": 1, "targets": manifest})
-    return {"status": "done", "targets": len(manifest), "switches": len(switches), "outputs": ["generated", "generated_manifest.json"]}
+    return {"status": "done", "targets": len(manifest), "switches": len(switches), "unknown_comments": unknown_count, "outputs": ["generated", "generated_manifest.json"]}
 
 
 def extract_existing_cmake(ctx: dict[str, Any]) -> dict[str, Any]:

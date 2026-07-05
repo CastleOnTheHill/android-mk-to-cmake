@@ -8,7 +8,7 @@
 
 - `discover`：发现指定 `--focus` 目录中的 `Makefile.am` 和 `CMakeLists.txt`。
 - `parse_makefiles`：解析 Automake 赋值、include、条件块和 target。
-- `convert_makefiles`：生成 CMake，并生成 `MakefileSwitches.cmake` 兼容开关层。
+- `convert_makefiles`：生成中间 CMake，并生成 `MakefileSwitches.cmake` 兼容开关层；脚本不能转换的 unknown 片段会按原解析顺序写成 TODO 注释。
 - `extract_existing_cmake`：读取已有 CMake target 信息。
 - `compare_with_existing`：对比生成 target source 和既有 CMake baseline。
 - `analyze_config_switches`：检查 Automake 条件开关是否映射到已有 CMake 和生成 CMake。
@@ -50,7 +50,7 @@ python3 android-mk-to-cmake/lite_dag/run.py \
 - `graph_run.json`：每个 DAG 节点的状态、耗时、依赖和摘要。
 - `dashboard.html`：静态监控页面。
 - `make_ir.json`：解析后的 Makefile IR。
-- `generated/`：生成的 CMake 工程。
+- `generated/`：脚本转换生成的中间 CMake 工程。每个子目录的 `CMakeLists.txt` 会保留可转换 target，并把动态 include、自定义 rule 等 unknown 片段按原顺序写成注释，供后续 AI 或人工继续处理。
 - `generated/MakefileSwitches.cmake`：Automake 条件开关到 CMake 兼容选项的声明。
 - `generated_manifest.json`：生成 target 和 source 列表。
 - `comparison.json`：生成 target source 与既有 CMake baseline 的对比。

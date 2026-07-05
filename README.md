@@ -12,6 +12,8 @@ The repository now keeps only the simple implementation:
 
 The active converter is [lite_dag/run.py](lite_dag/run.py). It parses focused Automake `Makefile.am` / `Makefile.inc` inputs, emits generated CMake, records every DAG node in `state/graph_run.json`, and writes a static dashboard at `state/dashboard.html`.
 
+The script conversion output under `state/generated/` is the intermediate CMake result. Fragments the script cannot convert, such as dynamic includes or custom rules, are preserved as ordered TODO comments in the generated `CMakeLists.txt` files for a later AI or manual pass.
+
 ## Quick Start
 
 ```sh
