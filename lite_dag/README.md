@@ -1,6 +1,6 @@
 # Lite DAG Makefile Converter
 
-This directory is a lightweight alternative to the LangGraph workflow.
+This directory contains the active implementation.
 
 It uses only Python standard library code:
 
@@ -43,7 +43,6 @@ The dashboard has three useful sections:
 ## Design
 
 The executor is intentionally small. It does not require a service, server,
-LangChain, LangGraph, or a Python version newer than 3.10. AI fallback is not
-part of this sub-workflow yet; this version is focused on proving that
-deterministic script stages and static monitoring are enough for Makefile
-conversion work.
+LangChain, LangGraph, AI fallback, or a Python version newer than 3.10. This
+version is focused on proving that deterministic script stages and static
+monitoring are enough for Makefile conversion work.

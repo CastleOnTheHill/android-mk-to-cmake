@@ -1,7 +1,0 @@
-{
-  "compile_definition_prefixes": ["-D"],
-  "include_prefixes": ["-I"],
-  "link_option_prefixes": ["-Wl,", "-L", "-u"],
-  "link_library_prefixes": ["-l"],
-  "compile_option_prefixes": ["-W", "-f", "-m", "-O", "-g", "-std="]
-}
