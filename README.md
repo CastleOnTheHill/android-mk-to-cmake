@@ -14,6 +14,10 @@ The active converter is [lite_dag/run.py](lite_dag/run.py). It parses focused Au
 
 The script conversion output under `state/generated/` is the intermediate CMake result. Fragments the script cannot convert, such as dynamic includes or custom rules, are preserved as ordered TODO comments in the generated `CMakeLists.txt` files for a later AI or manual pass.
 
+It can also read multiple project config files and preload variables from common mk files. For example, pass `--config-file .config --config-file .euap_config --var-file build/top.mk` so config values and variables such as `TOPDIR` participate in conditional include and mk dependency resolution.
+
+During parsing, makefiles are classified as `target_definition`, `judgment_package`, or `variable_fragment`. Target-definition files keep ordered target operations, so conditional source/header/flag additions are emitted as target-level CMake commands such as `target_sources()` and `target_compile_options()`.
+
 ## Quick Start
 
 ```sh
@@ -21,6 +25,9 @@ python3 android-mk-to-cmake/lite_dag/run.py \
   --root /path/to/project \
   --state-dir /tmp/mk2cmake-state \
   --focus lib --focus src \
+  --config-file .config \
+  --config-file .euap_config \
+  --var-file build/top.mk \
   --force
 ```
 

@@ -4,12 +4,10 @@ from __future__ import annotations
 import argparse
 import html
 import json
-import os
 import pathlib
 import re
 import shutil
 import subprocess
-import sys
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -17,6 +15,29 @@ from typing import Any, Callable
 
 
 SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".rc"}
+TARGET_CONTAINERS = ["lib_LTLIBRARIES", "noinst_LTLIBRARIES", "bin_PROGRAMS", "noinst_PROGRAMS"]
+GENERIC_TARGET_VARS = {"TARGET", "TARGET_NAME", "MODULE", "MODULE_NAME", "LOCAL_MODULE", "PACKAGE", "PACKAGE_NAME"}
+SOURCE_VAR_SUFFIXES = ("_SOURCES", "_HEADERS", "_HHEADERS")
+CPPFLAGS_VAR_SUFFIXES = ("_CPPFLAGS", "_INCLUDES", "_INCLUDE_DIRS")
+COMPILE_OPTION_VAR_SUFFIXES = ("_CFLAGS", "_CXXFLAGS", "_ASFLAGS")
+LINK_VAR_SUFFIXES = ("_LDADD", "_LIBADD", "_LDFLAGS", "_LDLIBS")
+GENERIC_SOURCE_VARS = {"SOURCES", "SRCS", "CSOURCES", "CXXSOURCES", "HEADERS", "HDRS", "HHEADERS"}
+GENERIC_CPPFLAGS_VARS = {"CPPFLAGS", "AM_CPPFLAGS", "INCLUDES", "INCLUDE_DIRS"}
+GENERIC_COMPILE_OPTION_VARS = {"CFLAGS", "CXXFLAGS", "ASFLAGS", "AM_CFLAGS", "AM_CXXFLAGS"}
+GENERIC_LINK_VARS = {"LDADD", "LIBADD", "LDFLAGS", "LDLIBS"}
+TARGET_OPERATION_SUFFIXES = (
+    (SOURCE_VAR_SUFFIXES, "sources"),
+    (CPPFLAGS_VAR_SUFFIXES, "cppflags"),
+    (COMPILE_OPTION_VAR_SUFFIXES, "compile_options"),
+    (LINK_VAR_SUFFIXES, "link_items"),
+)
+GENERIC_OPERATION_VARS = (
+    (GENERIC_SOURCE_VARS, "sources", "current"),
+    (GENERIC_CPPFLAGS_VARS, "cppflags", "all_if_am"),
+    (GENERIC_COMPILE_OPTION_VARS, "compile_options", "current"),
+    (GENERIC_LINK_VARS, "link_items", "current"),
+)
+TARGET_SUMMARY_KINDS = ("sources", "generated_sources", "include_dirs", "compile_definitions", "compile_options", "link_items")
 FALSE_CONDITIONS = {
     "USE_UNITY",
     "HAVE_WINDRES",
@@ -121,6 +142,81 @@ def split_words(value: str) -> list[str]:
     return [part for part in value.replace("\t", " ").split(" ") if part]
 
 
+def resolve_project_path(root: pathlib.Path, value: str) -> pathlib.Path:
+    path = pathlib.Path(value).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+def append_unique(values: list[str], value: str) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def strip_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def merge_variables(*sources: dict[str, list[str]]) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+    for source in sources:
+        for key, values in source.items():
+            merged[key] = list(values)
+    return merged
+
+
+def default_make_variables(root: pathlib.Path) -> dict[str, list[str]]:
+    root_text = root.as_posix()
+    return {
+        "TOPDIR": [root_text],
+        "CURDIR": [root_text],
+        "top_srcdir": [root_text],
+        "top_builddir": [root_text],
+    }
+
+
+def expand_make_text(text: str, variables: dict[str, list[str]]) -> tuple[str, list[str]]:
+    unresolved: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        values = variables.get(name)
+        if values is None:
+            unresolved.append(name)
+            return match.group(0)
+        if not values:
+            return ""
+        return " ".join(values)
+
+    expanded = re.sub(r"\$\(([^)]+)\)|\$\{([^}]+)\}", replace, text)
+    return expanded, unresolved
+
+
+def variable_truthy(values: list[str] | None) -> bool:
+    if not values:
+        return False
+    text = " ".join(values).strip().strip('"').strip("'").lower()
+    return text not in {"", "0", "n", "no", "false", "off", "not_set"}
+
+
+def update_variable(variables: dict[str, list[str]], variable: str, operator: str, values: list[str]) -> None:
+    expanded = []
+    for value in values:
+        text, unresolved = expand_make_text(value, variables)
+        expanded.extend(split_words(text) if not unresolved else [value])
+    if operator == "+=":
+        variables.setdefault(variable, []).extend(expanded)
+    elif operator == "?=":
+        if variable not in variables or not variables[variable]:
+            variables[variable] = list(expanded)
+    else:
+        variables[variable] = list(expanded)
+
+
 def condition_default(expr: str) -> bool:
     token = expr.strip().split(" ", 1)[0]
     if token in TRUE_CONDITIONS:
@@ -159,6 +255,32 @@ def target_kind(container: str) -> str:
     return "unknown"
 
 
+def ordered_unique(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result
+
+
+def target_definition_kind(variable: str, values: list[str]) -> str | None:
+    if variable in TARGET_CONTAINERS and values:
+        return "automake"
+    if variable in GENERIC_TARGET_VARS and values:
+        return "generic"
+    return None
+
+
+def package_role_name(has_target_definition: bool, has_condition_or_include: bool, has_assignments: bool) -> str:
+    if has_target_definition:
+        return "target_definition"
+    if has_condition_or_include:
+        return "judgment_package"
+    if has_assignments:
+        return "variable_fragment"
+    return "empty"
+
+
 def normalize_source(base_dir: str, value: str) -> str:
     value = value.strip('"')
     value = value.replace("$(srcdir)/", "").replace("${srcdir}/", "")
@@ -195,8 +317,11 @@ class Assignment:
 class MakefileIR:
     path: str
     directory: str
+    package_kind: str = "empty"
+    file_roles: list[dict[str, Any]] = field(default_factory=list)
     assignments: list[Assignment] = field(default_factory=list)
     included_files: list[str] = field(default_factory=list)
+    include_edges: list[dict[str, Any]] = field(default_factory=list)
     variables: dict[str, list[str]] = field(default_factory=dict)
     targets: list[dict[str, Any]] = field(default_factory=list)
     unknown: list[dict[str, Any]] = field(default_factory=list)
@@ -205,19 +330,24 @@ class MakefileIR:
 
 class MakefileParser:
     assign_re = re.compile(r"^(?P<var>[A-Za-z0-9_.$()/{}+-]+)\s*(?P<op>\+=|:=|\?=|=)\s*(?P<value>.*)$")
-    include_re = re.compile(r"^include\s+(?P<path>.+)$")
+    include_re = re.compile(r"^(?:-?include|sinclude)\s+(?P<path>.+)$")
 
-    def __init__(self, root: pathlib.Path):
+    def __init__(self, root: pathlib.Path, initial_variables: dict[str, list[str]] | None = None):
         self.root = root.resolve()
+        self.initial_variables = merge_variables(default_make_variables(self.root), initial_variables or {})
         self._sequence = 0
 
     def parse(self, rel_path: str) -> MakefileIR:
         self._sequence = 0
         path = self.root / rel_path
         ir = MakefileIR(path=rel_path, directory=path.parent.relative_to(self.root).as_posix())
-        self._parse_into(ir, path, [])
-        ir.variables = self._build_variables(ir.assignments)
+        variables = merge_variables(self.initial_variables)
+        self._parse_into(ir, path, [], variables)
+        ir.variables = self._build_variables(ir.assignments, self.initial_variables)
         ir.targets = self._build_targets(ir)
+        ir.file_roles = self._classify_files(ir)
+        entry_role = next((item["role"] for item in ir.file_roles if item["file"] == ir.path), "")
+        ir.package_kind = entry_role or package_role_name(bool(ir.targets), bool(ir.conditions or ir.include_edges), bool(ir.assignments))
         return ir
 
     def _next_sequence(self) -> int:
@@ -231,7 +361,9 @@ class MakefileParser:
         item.update(extra)
         return item
 
-    def _parse_into(self, ir: MakefileIR, path: pathlib.Path, include_stack: list[pathlib.Path]) -> None:
+    def _parse_into(self, ir: MakefileIR, path: pathlib.Path, include_stack: list[pathlib.Path], variables: dict[str, list[str]] | None = None) -> None:
+        if variables is None:
+            variables = merge_variables(self.initial_variables)
         if path in include_stack:
             ir.unknown.append(self._unknown(path, None, self._next_sequence(), "include_cycle"))
             return
@@ -242,11 +374,28 @@ class MakefileParser:
             if not text:
                 continue
             seq = self._next_sequence()
+            condition = self._parse_condition(text, variables)
+            if condition:
+                condition["file"] = rel(path, self.root)
+                condition["line"] = row["line"]
+                condition["seq"] = seq
+                ir.conditions.append(condition)
+                condition_stack.append(
+                    {
+                        "raw": text,
+                        "expr": condition["expr"],
+                        "switch": condition["switch"],
+                        "active": condition["active"],
+                        "negated": condition["negated"],
+                    }
+                )
+                continue
             if text.startswith("if ") or re.match(r"^if[A-Z0-9_]+\b", text):
                 expr = text[3:].strip() if text.startswith("if ") else text[2:].strip()
                 switch = condition_switch(expr)
-                ir.conditions.append({"file": rel(path, self.root), "line": row["line"], "seq": seq, "raw": text, "expr": expr, "switch": switch})
-                condition_stack.append({"raw": text, "expr": expr, "switch": switch, "active": condition_default(expr), "negated": False})
+                active = self._evaluate_symbol_condition(expr, variables)
+                ir.conditions.append({"file": rel(path, self.root), "line": row["line"], "seq": seq, "raw": text, "expr": expr, "switch": switch, "active": active, "negated": False})
+                condition_stack.append({"raw": text, "expr": expr, "switch": switch, "active": active, "negated": False})
                 continue
             if text == "else":
                 if condition_stack:
@@ -268,16 +417,25 @@ class MakefileParser:
                 continue
             include = self.include_re.match(text)
             if include:
-                include_value = include.group("path").strip().strip('"')
-                if "$" in include_value:
-                    ir.unknown.append(self._unknown(path, row, seq, "dynamic_include", expr=include_value))
+                active = all(bool(item["active"]) for item in condition_stack)
+                if not active:
                     continue
-                include_path = (path.parent / include_value).resolve()
-                if include_path.exists():
-                    ir.included_files.append(rel(include_path, self.root))
-                    self._parse_into(ir, include_path, include_stack)
-                else:
-                    ir.unknown.append(self._unknown(path, row, seq, "missing_include", expr=include_value))
+                include_value = include.group("path").strip().strip('"')
+                include_paths, unresolved = self._resolve_include_paths(path, include_value, variables)
+                if unresolved:
+                    ir.unknown.append(self._unknown(path, row, seq, "dynamic_include", expr=include_value, unresolved_variables=unresolved))
+                    continue
+                if not include_paths:
+                    ir.unknown.append(self._unknown(path, row, seq, "empty_include", expr=include_value))
+                    continue
+                for include_path in include_paths:
+                    resolved = rel(include_path, self.root)
+                    if include_path.exists():
+                        append_unique(ir.included_files, resolved)
+                        ir.include_edges.append({"from": rel(path, self.root), "to": resolved, "line": row["line"], "expr": include_value, "resolved": resolved})
+                        self._parse_into(ir, include_path, include_stack, variables)
+                    else:
+                        ir.unknown.append(self._unknown(path, row, seq, "missing_include", expr=include_value, resolved=resolved))
                 continue
             match = self.assign_re.match(text)
             if not match:
@@ -285,32 +443,91 @@ class MakefileParser:
                     ir.unknown.append(self._unknown(path, row, seq, "recipe_or_rule", text=text[:120]))
                 continue
             active = all(bool(item["active"]) for item in condition_stack)
-            ir.assignments.append(
-                Assignment(
-                    file=rel(path, self.root),
-                    line=row["line"],
-                    seq=seq,
-                    variable=match.group("var"),
-                    operator=match.group("op"),
-                    values=split_words(match.group("value")),
-                    raw=row["raw"],
-                    conditions=[item["raw"] for item in condition_stack],
-                    condition_switches=[item["switch"] for item in condition_stack],
-                    active=active,
-                )
+            assignment = Assignment(
+                file=rel(path, self.root),
+                line=row["line"],
+                seq=seq,
+                variable=match.group("var"),
+                operator=match.group("op"),
+                values=split_words(match.group("value")),
+                raw=row["raw"],
+                conditions=[item["raw"] for item in condition_stack],
+                condition_switches=[item["switch"] for item in condition_stack],
+                active=active,
             )
+            ir.assignments.append(assignment)
+            if active:
+                update_variable(variables, assignment.variable, assignment.operator, assignment.values)
+            continue
 
-    def _build_variables(self, assignments: list[Assignment]) -> dict[str, list[str]]:
-        variables: dict[str, list[str]] = {}
+    def _parse_condition(self, text: str, variables: dict[str, list[str]]) -> dict[str, Any] | None:
+        if text.startswith("ifeq") or text.startswith("ifneq"):
+            keyword, _, body = text.partition(" ")
+            left, right = self._condition_args(body.strip())
+            left_value = expand_make_text(left, variables)[0].strip()
+            right_value = expand_make_text(right, variables)[0].strip()
+            active = left_value == right_value
+            if keyword == "ifneq":
+                active = not active
+            switch = self._first_variable_ref(left) or self._first_variable_ref(right) or condition_switch(left)
+            return {"raw": text, "expr": body.strip(), "switch": switch, "active": active, "negated": keyword == "ifneq", "left": left_value, "right": right_value}
+        if text.startswith("ifdef ") or text.startswith("ifndef "):
+            keyword, _, name = text.partition(" ")
+            name = name.strip()
+            active = variable_truthy(variables.get(name))
+            if keyword == "ifndef":
+                active = not active
+            return {"raw": text, "expr": name, "switch": name, "active": active, "negated": keyword == "ifndef"}
+        return None
+
+    def _condition_args(self, body: str) -> tuple[str, str]:
+        body = body.strip()
+        if body.startswith("(") and body.endswith(")"):
+            body = body[1:-1]
+            depth = 0
+            for index, char in enumerate(body):
+                if char in "({":
+                    depth += 1
+                elif char in ")}" and depth:
+                    depth -= 1
+                elif char == "," and depth == 0:
+                    return strip_quotes(body[:index].strip()), strip_quotes(body[index + 1 :].strip())
+        parts = split_words(body)
+        if len(parts) >= 2:
+            return strip_quotes(parts[0]), strip_quotes(parts[1])
+        return body, ""
+
+    def _first_variable_ref(self, text: str) -> str:
+        match = re.search(r"\$\(([^)]+)\)|\$\{([^}]+)\}", text)
+        return (match.group(1) or match.group(2)) if match else ""
+
+    def _evaluate_symbol_condition(self, expr: str, variables: dict[str, list[str]]) -> bool:
+        text = expr.strip()
+        negated = text.startswith("not ")
+        if negated:
+            text = text[4:].strip()
+        token = text.split(" ", 1)[0]
+        active = variable_truthy(variables.get(token)) if token in variables else condition_default(expr)
+        return not active if negated else active
+
+    def _resolve_include_paths(self, source_file: pathlib.Path, include_value: str, variables: dict[str, list[str]]) -> tuple[list[pathlib.Path], list[str]]:
+        expanded, unresolved = expand_make_text(include_value, variables)
+        if unresolved:
+            return [], sorted(set(unresolved))
+        paths = []
+        for item in split_words(expanded):
+            candidate = pathlib.Path(strip_quotes(item))
+            if not candidate.is_absolute():
+                candidate = source_file.parent / candidate
+            paths.append(candidate.resolve())
+        return paths, []
+
+    def _build_variables(self, assignments: list[Assignment], initial_variables: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
+        variables: dict[str, list[str]] = merge_variables(initial_variables or {})
         for item in assignments:
             if not item.active:
                 continue
-            if item.operator == "+=":
-                variables.setdefault(item.variable, []).extend(item.values)
-            elif item.operator == "?=":
-                variables.setdefault(item.variable, list(item.values))
-            else:
-                variables[item.variable] = list(item.values)
+            update_variable(variables, item.variable, item.operator, item.values)
         expanded: dict[str, list[str]] = {}
         for key in variables:
             expanded[key] = self.expand_values(variables[key], variables)
@@ -340,69 +557,217 @@ class MakefileParser:
         return expanded
 
     def _build_targets(self, ir: MakefileIR) -> list[dict[str, Any]]:
-        containers = ["lib_LTLIBRARIES", "noinst_LTLIBRARIES", "bin_PROGRAMS", "noinst_PROGRAMS"]
         targets: list[dict[str, Any]] = []
-        for container in containers:
+        seen_names: set[str] = set()
+        for container in TARGET_CONTAINERS:
             for raw_target in ir.variables.get(container, []):
                 if raw_target.startswith("$("):
                     continue
                 target_var = automake_target_var(raw_target)
                 name = cmake_target_name(raw_target)
-                source_values = []
-                generated_refs: set[str] = set()
-                for source_var in [f"{target_var}_SOURCES", f"nodist_{target_var}_SOURCES"]:
-                    source_values.extend(self.expand_values(ir.variables.get(source_var, []), ir.variables, generated_refs=generated_refs))
-                generated_values: set[str] = set()
-                for ref in generated_refs:
-                    generated_values.update(ir.variables.get(ref, []))
-                for variable, values in ir.variables.items():
-                    if variable.lower().endswith("_gen"):
-                        generated_values.update(values)
-                sources = sorted(
-                    {
-                        normalize_source(ir.directory, value)
-                        for value in source_values
-                        if pathlib.PurePosixPath(value.strip('"')).suffix in SOURCE_EXTS
-                        and "$" not in value
-                        and "@" not in value
-                        and value not in generated_values
-                    }
-                )
-                generated_sources = sorted(
-                    {
-                        normalize_source(ir.directory, value)
-                        for value in generated_values
-                        if pathlib.PurePosixPath(value.strip('"')).suffix in SOURCE_EXTS and "$" not in value and "@" not in value
-                    }
-                )
-                cppflags = [*ir.variables.get("AM_CPPFLAGS", []), *ir.variables.get(f"{target_var}_CPPFLAGS", [])]
-                include_dirs = []
-                definitions = []
-                compile_options = []
-                for flag in cppflags:
-                    if flag.startswith("-I"):
-                        include_dirs.append(self._normalize_include(ir.directory, flag[2:]))
-                    elif flag.startswith("-D"):
-                        definitions.append(flag[2:])
-                    elif "$" not in flag and "@" not in flag:
-                        compile_options.append(flag)
-                targets.append(
-                    {
-                        "name": name,
-                        "raw_name": raw_target,
-                        "kind": target_kind(container),
-                        "container": container,
-                        "directory": ir.directory,
-                        "seq": self._target_sequence(ir, container, raw_target, target_var),
-                        "sources": sources,
-                        "generated_sources": generated_sources,
-                        "include_dirs": sorted(dict.fromkeys(include_dirs)),
-                        "compile_definitions": sorted(dict.fromkeys(definitions)),
-                        "compile_options": compile_options,
-                        "link_items": ir.variables.get(f"{target_var}_LDADD", []),
-                    }
-                )
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                targets.append(self._new_target(ir, name, raw_target, target_var, target_kind(container), container, "automake", self._target_sequence(ir, container, raw_target, target_var)))
+        for assignment in ir.assignments:
+            if not assignment.active or not target_definition_kind(assignment.variable, assignment.values) == "generic":
+                continue
+            for raw_target in self.expand_values(assignment.values, ir.variables):
+                if "$" in raw_target or "@" in raw_target:
+                    continue
+                name = cmake_target_name(raw_target)
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                targets.append(self._new_target(ir, name, raw_target, automake_target_var(raw_target), self._generic_target_kind(ir.variables), assignment.variable, "generic", assignment.seq, assignment.file))
+        self._attach_target_operations(ir, targets)
+        for target in targets:
+            self._summarize_target_operations(target)
         return targets
+
+    def _new_target(self, ir: MakefileIR, name: str, raw_name: str, target_var: str, kind: str, container: str, definition_style: str, seq: int, definition_file: str | None = None) -> dict[str, Any]:
+        return {
+            "name": name,
+            "raw_name": raw_name,
+            "kind": kind,
+            "container": container,
+            "definition_style": definition_style,
+            "target_var": target_var,
+            "directory": ir.directory,
+            "definition_file": definition_file or ir.path,
+            "seq": seq,
+            "sources": [],
+            "generated_sources": [],
+            "include_dirs": [],
+            "compile_definitions": [],
+            "compile_options": [],
+            "link_items": [],
+            "operations": [],
+        }
+
+    def _generic_target_kind(self, variables: dict[str, list[str]]) -> str:
+        text = " ".join(variables.get("TARGET_TYPE", []) + variables.get("LOCAL_MODULE_CLASS", [])).lower()
+        if any(token in text for token in ["executable", "program", "bin"]):
+            return "executable"
+        return "library"
+
+    def _attach_target_operations(self, ir: MakefileIR, targets: list[dict[str, Any]]) -> None:
+        for assignment in ir.assignments:
+            if not assignment.active:
+                continue
+            for target, operation_kind in self._targets_for_assignment(assignment, targets):
+                operations = self._operations_for_assignment(ir, target, assignment, operation_kind)
+                target["operations"].extend(operations)
+
+    def _targets_for_assignment(self, assignment: Assignment, targets: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+        variable = assignment.variable
+        specific: list[tuple[dict[str, Any], str]] = []
+        for target in targets:
+            kind = self._target_specific_operation_kind(variable, target)
+            if kind:
+                specific.append((target, kind))
+        if specific:
+            return specific
+        for variables, kind, scope in GENERIC_OPERATION_VARS:
+            if variable not in variables:
+                continue
+            if scope == "all_if_am" and variable.startswith("AM_"):
+                return [(target, kind) for target in targets]
+            current = self._current_target_for_seq(targets, assignment.seq)
+            return [(current, kind)] if current else []
+        return []
+
+    def _target_specific_operation_kind(self, variable: str, target: dict[str, Any]) -> str | None:
+        target_var = target["target_var"]
+        normalized = variable.removeprefix("nodist_")
+        if not normalized.startswith(f"{target_var}_"):
+            return None
+        for suffixes, kind in TARGET_OPERATION_SUFFIXES:
+            if normalized.endswith(suffixes):
+                return kind
+        return None
+
+    def _current_target_for_seq(self, targets: list[dict[str, Any]], seq: int) -> dict[str, Any] | None:
+        candidates = [target for target in targets if int(target.get("seq", 0)) <= seq]
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda target: int(target.get("seq", 0)))[-1]
+
+    def _operations_for_assignment(self, ir: MakefileIR, target: dict[str, Any], assignment: Assignment, operation_kind: str) -> list[dict[str, Any]]:
+        base = {
+            "seq": assignment.seq,
+            "file": assignment.file,
+            "line": assignment.line,
+            "variable": assignment.variable,
+            "conditions": assignment.conditions,
+            "condition_switches": assignment.condition_switches,
+        }
+        if operation_kind == "sources":
+            sources, generated_sources = self._source_values_for_assignment(ir, target, assignment)
+            operations = []
+            if sources:
+                operations.append({**base, "kind": "sources", "values": sources})
+            if generated_sources:
+                operations.append({**base, "kind": "generated_sources", "values": generated_sources})
+            return operations
+        if operation_kind == "cppflags":
+            include_dirs, definitions, compile_options = self._split_cppflags(ir, assignment)
+            operations = []
+            if include_dirs:
+                operations.append({**base, "kind": "include_dirs", "values": include_dirs})
+            if definitions:
+                operations.append({**base, "kind": "compile_definitions", "values": definitions})
+            if compile_options:
+                operations.append({**base, "kind": "compile_options", "values": compile_options})
+            return operations
+        if operation_kind == "compile_options":
+            values = [value for value in self.expand_values(assignment.values, ir.variables) if "$" not in value and "@" not in value]
+            return [{**base, "kind": "compile_options", "values": values}] if values else []
+        if operation_kind == "link_items":
+            values = self.expand_values(assignment.values, ir.variables)
+            return [{**base, "kind": "link_items", "values": values}] if values else []
+        return []
+
+    def _source_values_for_assignment(self, ir: MakefileIR, target: dict[str, Any], assignment: Assignment) -> tuple[list[str], list[str]]:
+        generated_refs: set[str] = set()
+        source_values = self.expand_values(assignment.values, ir.variables, generated_refs=generated_refs)
+        generated_values: set[str] = set()
+        for ref in generated_refs:
+            generated_values.update(ir.variables.get(ref, []))
+        for variable, values in ir.variables.items():
+            if variable.lower().endswith("_gen"):
+                generated_values.update(values)
+        sources = ordered_unique(
+            [
+                normalize_source(target["directory"], value)
+                for value in source_values
+                if pathlib.PurePosixPath(value.strip('"')).suffix in SOURCE_EXTS
+                and "$" not in value
+                and "@" not in value
+                and value not in generated_values
+            ]
+        )
+        generated_sources = ordered_unique(
+            [
+                normalize_source(target["directory"], value)
+                for value in generated_values
+                if pathlib.PurePosixPath(value.strip('"')).suffix in SOURCE_EXTS and "$" not in value and "@" not in value
+            ]
+        )
+        return sources, generated_sources
+
+    def _split_cppflags(self, ir: MakefileIR, assignment: Assignment) -> tuple[list[str], list[str], list[str]]:
+        include_dirs: list[str] = []
+        definitions: list[str] = []
+        compile_options: list[str] = []
+        for flag in self.expand_values(assignment.values, ir.variables):
+            if flag.startswith("-I"):
+                include_dirs.append(self._normalize_include(pathlib.PurePosixPath(assignment.file).parent.as_posix(), flag[2:]))
+            elif flag.startswith("-D"):
+                definitions.append(flag[2:])
+            elif "$" not in flag and "@" not in flag:
+                compile_options.append(flag)
+        return ordered_unique(include_dirs), ordered_unique(definitions), ordered_unique(compile_options)
+
+    def _summarize_target_operations(self, target: dict[str, Any]) -> None:
+        target["operations"] = sorted(target["operations"], key=lambda item: int(item.get("seq", 0)))
+        for kind in TARGET_SUMMARY_KINDS:
+            target[kind] = ordered_unique([value for op in target["operations"] if op["kind"] == kind for value in op["values"]])
+
+    def _classify_files(self, ir: MakefileIR) -> list[dict[str, Any]]:
+        files = {ir.path}
+        assignment_files: set[str] = set()
+        condition_or_include_files: set[str] = set()
+        target_definition_files = {target.get("definition_file", ir.path) for target in ir.targets}
+        for assignment in ir.assignments:
+            files.add(assignment.file)
+            assignment_files.add(assignment.file)
+            if target_definition_kind(assignment.variable, assignment.values):
+                target_definition_files.add(assignment.file)
+        for condition in ir.conditions:
+            file = condition.get("file", ir.path)
+            files.add(file)
+            condition_or_include_files.add(file)
+        for edge in ir.include_edges:
+            files.add(edge.get("from", ir.path))
+            files.add(edge.get("to", ir.path))
+            condition_or_include_files.add(edge.get("from", ir.path))
+        for target in ir.targets:
+            for operation in target.get("operations", []):
+                file = operation.get("file", ir.path)
+                files.add(file)
+                target_definition_files.add(file)
+        for item in ir.unknown:
+            files.add(item.get("file", ir.path))
+            if item.get("reason") in {"dynamic_include", "missing_include", "empty_include", "include_cycle"}:
+                condition_or_include_files.add(item.get("file", ir.path))
+        return [
+            {
+                "file": file,
+                "role": package_role_name(file in target_definition_files, file in condition_or_include_files, file in assignment_files),
+            }
+            for file in sorted(files)
+        ]
 
     def _target_sequence(self, ir: MakefileIR, container: str, raw_target: str, target_var: str) -> int:
         container_seqs = [
@@ -490,30 +855,117 @@ class DagExecutor:
 def discover(ctx: dict[str, Any]) -> dict[str, Any]:
     root = ctx["root"]
     focus = ctx["focus"]
+    makefile_names = ctx.get("makefile_names") or ["Makefile.am"]
     makefiles = []
     cmake_files = []
     for item in focus:
-        mf = root / item / "Makefile.am"
+        for name in makefile_names:
+            mf = root / item / name
+            if mf.exists():
+                append_unique(makefiles, rel(mf, root))
         cm = root / item / "CMakeLists.txt"
-        if mf.exists():
-            makefiles.append(rel(mf, root))
         if cm.exists():
             cmake_files.append(rel(cm, root))
+    for item in ctx.get("makefiles", []):
+        path = resolve_project_path(root, item)
+        if path.exists():
+            append_unique(makefiles, rel(path, root))
     write_json(ctx["state_dir"] / "inputs.json", {"root": root.as_posix(), "makefiles": makefiles, "cmake_files": cmake_files})
     return {"status": "done", "makefiles": len(makefiles), "cmake_files": len(cmake_files), "outputs": ["inputs.json"]}
 
 
+def parse_config_line(path: pathlib.Path, root: pathlib.Path, line_no: int, raw: str) -> dict[str, Any] | None:
+    disabled = re.match(r"^#\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+is\s+not\s+set\s*$", raw)
+    if disabled:
+        return {"name": disabled.group("name"), "value": "", "state": "disabled", "file": rel(path, root), "line": line_no}
+    text = strip_comment(raw).strip()
+    if not text:
+        return None
+    match = re.match(r"^(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>.*)$", text)
+    if not match:
+        return None
+    value = strip_quotes(match.group("value").strip())
+    state = "enabled" if value in {"y", "m"} else "set"
+    return {"name": match.group("name"), "value": value, "state": state, "file": rel(path, root), "line": line_no}
+
+
+def variables_from_config(config: dict[str, Any]) -> dict[str, list[str]]:
+    values = config.get("values", {})
+    return {name: [item.get("value", "")] for name, item in values.items()}
+
+
+def parse_configs(ctx: dict[str, Any]) -> dict[str, Any]:
+    root = ctx["root"]
+    config_inputs = list(ctx.get("config_files", []))
+    if not config_inputs:
+        config_inputs = [name for name in [".config", ".euap_config"] if (root / name).exists()]
+    files = []
+    values: dict[str, dict[str, Any]] = {}
+    for item in config_inputs:
+        path = resolve_project_path(root, item)
+        file_result: dict[str, Any] = {"path": rel(path, root), "exists": path.exists(), "values": {}, "enabled": [], "disabled": []}
+        if path.exists():
+            for line_no, raw in enumerate(read_text(path).splitlines(), start=1):
+                row = parse_config_line(path, root, line_no, raw)
+                if not row:
+                    continue
+                name = row["name"]
+                file_result["values"][name] = {"value": row["value"], "state": row["state"], "line": line_no}
+                if row["state"] == "disabled":
+                    file_result["disabled"].append(name)
+                elif row["state"] == "enabled":
+                    file_result["enabled"].append(name)
+                values[name] = row
+        files.append(file_result)
+    payload = {"schema_version": 1, "files": files, "values": values, "variables": variables_from_config({"values": values})}
+    write_json(ctx["state_dir"] / "dot_config.json", payload)
+    return {"status": "done", "files": len(files), "values": len(values), "outputs": ["dot_config.json"]}
+
+
+def parse_project_variables(ctx: dict[str, Any]) -> dict[str, Any]:
+    config = load_json(ctx["state_dir"] / "dot_config.json", {"variables": {}})
+    parser = MakefileParser(ctx["root"], variables_from_config(config))
+    files = []
+    merged = merge_variables(default_make_variables(ctx["root"]), variables_from_config(config))
+    for item in ctx.get("var_files", []):
+        path = resolve_project_path(ctx["root"], item)
+        file_result: dict[str, Any] = {"path": rel(path, ctx["root"]), "exists": path.exists(), "variables": {}, "included_files": [], "include_edges": [], "unknown": []}
+        if path.exists():
+            ir = parser.parse(rel(path, ctx["root"]))
+            file_result.update(
+                {
+                    "variables": ir.variables,
+                    "included_files": ir.included_files,
+                    "include_edges": ir.include_edges,
+                    "unknown": ir.unknown,
+                }
+            )
+            merged = merge_variables(merged, ir.variables)
+        files.append(file_result)
+    payload = {"schema_version": 1, "files": files, "variables": merged}
+    write_json(ctx["state_dir"] / "project_variables.json", payload)
+    return {"status": "done", "files": len(files), "variables": len(merged), "outputs": ["project_variables.json"]}
+
+
 def parse_makefiles(ctx: dict[str, Any]) -> dict[str, Any]:
     inputs = load_json(ctx["state_dir"] / "inputs.json", {"makefiles": []})
-    parser = MakefileParser(ctx["root"])
+    config = load_json(ctx["state_dir"] / "dot_config.json", {"variables": {}})
+    project_variables = load_json(ctx["state_dir"] / "project_variables.json", {"variables": {}})
+    initial_variables = merge_variables(default_make_variables(ctx["root"]), variables_from_config(config), project_variables.get("variables", {}))
+    parser = MakefileParser(ctx["root"], initial_variables)
     irs = []
+    edges = []
     for mf in inputs["makefiles"]:
         ir = parser.parse(mf)
+        edges.extend(ir.include_edges)
         irs.append(
             {
                 "path": ir.path,
                 "directory": ir.directory,
+                "package_kind": ir.package_kind,
+                "file_roles": ir.file_roles,
                 "included_files": ir.included_files,
+                "include_edges": ir.include_edges,
                 "variables": ir.variables,
                 "targets": ir.targets,
                 "unknown": ir.unknown,
@@ -522,52 +974,66 @@ def parse_makefiles(ctx: dict[str, Any]) -> dict[str, Any]:
             }
         )
     write_json(ctx["state_dir"] / "make_ir.json", {"schema_version": 1, "files": irs})
-    return {"status": "done", "files": len(irs), "targets": sum(len(item["targets"]) for item in irs), "outputs": ["make_ir.json"]}
+    write_json(ctx["state_dir"] / "mk_dependencies.json", {"schema_version": 1, "edges": edges})
+    return {"status": "done", "files": len(irs), "targets": sum(len(item["targets"]) for item in irs), "include_edges": len(edges), "outputs": ["make_ir.json", "mk_dependencies.json"]}
 
 
 def cmake_path_for_source(source_root_var: str, rel_source: str) -> str:
     return f"${{{source_root_var}}}/{rel_source}"
 
 
-def render_target(target: dict[str, Any]) -> str:
+def render_target_declaration(target: dict[str, Any]) -> str:
     lines: list[str] = []
     name = target["name"]
     kind = target["kind"]
     add = "add_executable" if kind == "executable" else "add_library"
     lib_kind = "STATIC" if kind == "library" else ""
-    lines.append(f"# from {target['directory']}/Makefile.am target {target['raw_name']}")
+    lines.append(f"# target from {target.get('definition_file', target['directory'])}: {target['raw_name']}")
     lines.append(f"{add}({name}{(' ' + lib_kind) if lib_kind else ''})")
-    if target["sources"]:
-        lines.append(f"target_sources({name}")
-        lines.append("    PRIVATE")
-        for source in target["sources"]:
-            lines.append(f"        {cmake_path_for_source('MK_SOURCE_ROOT', source)}")
-        lines.append(")")
-    if target["include_dirs"]:
-        lines.append(f"target_include_directories({name}")
-        lines.append("    PRIVATE")
-        for item in target["include_dirs"]:
-            lines.append(f"        {cmake_path_for_source('MK_SOURCE_ROOT', item)}")
-        lines.append(")")
-    if target["compile_definitions"]:
-        lines.append(f"target_compile_definitions({name}")
-        lines.append("    PRIVATE")
-        for item in target["compile_definitions"]:
-            lines.append(f"        {item}")
-        lines.append(")")
+    return "\n".join(lines) + "\n"
+
+
+def render_private_block(command: str, target: str, values: list[str], mapper: Callable[[str], str] | None = None) -> list[str]:
+    mapper = mapper or (lambda value: value)
+    return [f"{command}({target}", "    PRIVATE", *(f"        {mapper(value)}" for value in values), ")"]
+
+
+def render_link_operation(name: str, values: list[str]) -> list[str]:
     link_targets = []
     comments = []
-    for item in target.get("link_items", []):
+    for item in values:
         if item.endswith("/libcurl.la") or item == "libcurl.la":
             link_targets.append("libcurl")
         elif "$" in item or "@" in item:
             comments.append(item)
         else:
             link_targets.append(item)
-    if link_targets:
-        lines.append(f"target_link_libraries({name} PRIVATE {' '.join(link_targets)})")
-    for item in comments:
-        lines.append(f"# unresolved link item from Makefile.am: {item}")
+    lines = [f"target_link_libraries({name} PRIVATE {' '.join(link_targets)})"] if link_targets else []
+    lines.extend(f"# unresolved link item from Makefile.am: {item}" for item in comments)
+    return lines
+
+
+def render_target_operation(target: dict[str, Any], operation: dict[str, Any]) -> str:
+    lines: list[str] = []
+    name = target["name"]
+    kind = operation["kind"]
+    values = operation.get("values", [])
+    lines.append(f"# from {operation.get('file', '?')}:{operation.get('line', '?')} {operation.get('variable', '')}")
+    if operation.get("conditions"):
+        lines.append(f"# active Make conditions: {'; '.join(operation['conditions'])}")
+    if kind == "sources":
+        lines.extend(render_private_block("target_sources", name, values, lambda value: cmake_path_for_source("MK_SOURCE_ROOT", value)))
+    elif kind == "generated_sources":
+        for value in values:
+            lines.append(f"# generated source omitted from target_sources: {value}")
+    elif kind == "include_dirs":
+        lines.extend(render_private_block("target_include_directories", name, values, lambda value: cmake_path_for_source("MK_SOURCE_ROOT", value)))
+    elif kind == "compile_definitions":
+        lines.extend(render_private_block("target_compile_definitions", name, values))
+    elif kind == "compile_options":
+        lines.extend(render_private_block("target_compile_options", name, values))
+    elif kind == "link_items":
+        lines.extend(render_link_operation(name, values))
     return "\n".join(lines) + "\n"
 
 
@@ -658,17 +1124,30 @@ def convert_makefiles(ctx: dict[str, Any]) -> dict[str, Any]:
         if item["targets"] or item.get("unknown"):
             root_lines.append(f"add_subdirectory({item['directory']})")
         out = output_root / item["directory"] / "CMakeLists.txt"
-        body = ["# Generated by lite_dag/run.py.", "# Review before using as production CMake.", ""]
-        events: list[tuple[int, int, str, dict[str, Any]]] = []
+        body = [
+            "# Generated by lite_dag/run.py.",
+            "# Review before using as production CMake.",
+            f"# package kind: {item.get('package_kind', 'unknown')}",
+            "",
+        ]
+        events: list[tuple[int, int, int, str, dict[str, Any]]] = []
         for index, target in enumerate(item["targets"]):
-            events.append((int(target.get("seq", 0)), index, "target", target))
+            target_seq = int(target.get("seq", 0))
+            events.append((target_seq, 0, index, "target_declaration", target))
+            for op_index, operation in enumerate(target.get("operations", [])):
+                if operation.get("kind") == "generated_sources":
+                    continue
+                op_seq = max(int(operation.get("seq", 0)), target_seq)
+                events.append((op_seq, 2, op_index, "target_operation", {"target": target, "operation": operation}))
         for index, fragment in enumerate(item.get("unknown", [])):
             unknown_count += 1
-            events.append((int(fragment.get("seq", 0)), index, "unknown", fragment))
-        for _seq, _index, kind, payload in sorted(events, key=lambda event: (event[0], event[1], event[2])):
-            if kind == "target":
-                body.append(render_target(payload))
+            events.append((int(fragment.get("seq", 0)), 1, index, "unknown", fragment))
+        for _seq, _phase, _index, kind, payload in sorted(events, key=lambda event: (event[0], event[1], event[2])):
+            if kind == "target_declaration":
+                body.append(render_target_declaration(payload))
                 manifest.append({"directory": item["directory"], **payload})
+            elif kind == "target_operation":
+                body.append(render_target_operation(payload["target"], payload["operation"]))
             else:
                 body.append(render_unknown_fragment(payload))
         write_text(out, "\n".join(body).rstrip() + "\n")
@@ -883,46 +1362,92 @@ def check_generated_cmake(ctx: dict[str, Any]) -> dict[str, Any]:
     return {"status": "done" if cp.returncode == 0 else "failed", "returncode": cp.returncode, "outputs": ["cmake-check.log"]}
 
 
+def html_cell(value: Any, class_name: str = "") -> str:
+    class_attr = f" class='{html.escape(class_name)}'" if class_name else ""
+    return f"<td{class_attr}>{html.escape(str(value))}</td>"
+
+
+def html_row(cells: list[Any]) -> str:
+    rendered = []
+    for cell in cells:
+        if isinstance(cell, tuple):
+            rendered.append(html_cell(cell[0], cell[1]))
+        else:
+            rendered.append(html_cell(cell))
+    return f"<tr>{''.join(rendered)}</tr>"
+
+
+def html_table(headers: list[str], rows: list[list[Any]]) -> str:
+    head = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = "".join(html_row(row) for row in rows)
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def join_limited(values: list[str], limit: int) -> str:
+    return ", ".join(values[:limit])
+
+
 def render_dashboard(ctx: dict[str, Any]) -> dict[str, Any]:
     run = load_json(ctx["state_dir"] / "graph_run.json", {"tasks": []})
+    dot_config = load_json(ctx["state_dir"] / "dot_config.json", {"files": []})
+    deps = load_json(ctx["state_dir"] / "mk_dependencies.json", {"edges": []})
+    make_ir = load_json(ctx["state_dir"] / "make_ir.json", {"files": []})
     comparison = load_json(ctx["state_dir"] / "comparison.json", {"targets": []})
     switches = load_json(ctx["state_dir"] / "config_switches.json", {"switches": []})
-    rows = []
-    for task in run.get("tasks", []):
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(task.get('name', ''))}</td>"
-            f"<td class='{html.escape(task.get('status', ''))}'>{html.escape(task.get('status', ''))}</td>"
-            f"<td>{task.get('duration_sec', '')}</td>"
-            f"<td>{html.escape(json.dumps({k: v for k, v in task.items() if k not in {'traceback'}}, ensure_ascii=False))}</td>"
-            "</tr>"
-        )
-    comparison_rows = []
-    for item in comparison.get("targets", []):
-        comparison_rows.append(
-            "<tr>"
-            f"<td>{html.escape(item['target'])}</td>"
-            f"<td class='{html.escape(item['status'])}'>{html.escape(item['status'])}</td>"
-            f"<td>{item['generated_sources']}</td>"
-            f"<td>{item['existing_sources']}</td>"
-            f"<td>{html.escape(', '.join(item['missing_from_generated'][:10]))}</td>"
-            f"<td>{html.escape(', '.join(item['extra_in_generated'][:10]))}</td>"
-            "</tr>"
-        )
-    switch_rows = []
-    for item in switches.get("switches", []):
-        switch_rows.append(
-            "<tr>"
-            f"<td>{html.escape(item['switch'])}</td>"
-            f"<td>{html.escape(item['scope'])}</td>"
-            f"<td class='{html.escape(item['existing_status'])}'>{html.escape(item['existing_status'])}</td>"
-            f"<td class='{html.escape(item['generated_status'])}'>{html.escape(item['generated_status'])}</td>"
-            f"<td>{html.escape(', '.join(item['existing_cmake_matches']))}</td>"
-            f"<td>{html.escape(', '.join(item['aliases']))}</td>"
-            f"<td>{item['conditional_assignment_uses']}</td>"
-            f"<td>{html.escape(', '.join((item['locations'] + item.get('configure_locations', []))[:8]))}</td>"
-            "</tr>"
-        )
+    task_rows = [
+        [
+            task.get("name", ""),
+            (task.get("status", ""), task.get("status", "")),
+            task.get("duration_sec", ""),
+            json.dumps({k: v for k, v in task.items() if k != "traceback"}, ensure_ascii=False),
+        ]
+        for task in run.get("tasks", [])
+    ]
+    config_rows = [
+        [
+            item.get("path", ""),
+            (item.get("exists", False), "done" if item.get("exists") else "failed"),
+            len(item.get("values", {})),
+            join_limited(item.get("enabled", []), 12),
+            join_limited(item.get("disabled", []), 12),
+        ]
+        for item in dot_config.get("files", [])
+    ]
+    dep_rows = [[edge.get("from", ""), edge.get("to", ""), edge.get("line", ""), edge.get("expr", "")] for edge in deps.get("edges", [])]
+    classification_rows = [
+        [
+            item.get("path", ""),
+            item.get("package_kind", ""),
+            len(item.get("targets", [])),
+            sum(len(target.get("operations", [])) for target in item.get("targets", [])),
+            ", ".join(f"{role.get('file')}={role.get('role')}" for role in item.get("file_roles", [])),
+        ]
+        for item in make_ir.get("files", [])
+    ]
+    comparison_rows = [
+        [
+            item["target"],
+            (item["status"], item["status"]),
+            item["generated_sources"],
+            item["existing_sources"],
+            join_limited(item["missing_from_generated"], 10),
+            join_limited(item["extra_in_generated"], 10),
+        ]
+        for item in comparison.get("targets", [])
+    ]
+    switch_rows = [
+        [
+            item["switch"],
+            item["scope"],
+            (item["existing_status"], item["existing_status"]),
+            (item["generated_status"], item["generated_status"]),
+            ", ".join(item["existing_cmake_matches"]),
+            ", ".join(item["aliases"]),
+            item["conditional_assignment_uses"],
+            join_limited(item["locations"] + item.get("configure_locations", []), 8),
+        ]
+        for item in switches.get("switches", [])
+    ]
     page = f"""<!doctype html>
 <html>
 <head>
@@ -943,13 +1468,19 @@ code {{ background: #f6f8fa; padding: 2px 4px; }}
 <body>
 <h1>Lite DAG Dashboard</h1>
 <p>Root: <code>{html.escape(ctx['root'].as_posix())}</code></p>
-<p>State: <code>{html.escape(ctx['state_dir'].as_posix())}</code></p>
-<h2>Task Run</h2>
-<table><thead><tr><th>Node</th><th>Status</th><th>Seconds</th><th>Details</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
-<h2>curl Makefile vs Existing CMake Comparison</h2>
-<table><thead><tr><th>Target</th><th>Status</th><th>Generated sources</th><th>Existing CMake sources</th><th>Missing</th><th>Extra</th></tr></thead><tbody>{''.join(comparison_rows)}</tbody></table>
+	<p>State: <code>{html.escape(ctx['state_dir'].as_posix())}</code></p>
+	<h2>Task Run</h2>
+	{html_table(["Node", "Status", "Seconds", "Details"], task_rows)}
+	<h2>Config Inputs</h2>
+	{html_table(["Path", "Exists", "Values", "Enabled", "Disabled"], config_rows)}
+	<h2>MK Include Dependencies</h2>
+	{html_table(["From", "To", "Line", "Expression"], dep_rows)}
+	<h2>Makefile Classification</h2>
+	{html_table(["Entry", "Package Kind", "Targets", "Target Operations", "File Roles"], classification_rows)}
+	<h2>curl Makefile vs Existing CMake Comparison</h2>
+{html_table(["Target", "Status", "Generated sources", "Existing CMake sources", "Missing", "Extra"], comparison_rows)}
 <h2>Configuration Switch Coverage</h2>
-<table><thead><tr><th>Makefile switch</th><th>Scope</th><th>Existing CMake</th><th>Generated CMake</th><th>Matched CMake symbols</th><th>Known aliases</th><th>Conditional assignments</th><th>Locations</th></tr></thead><tbody>{''.join(switch_rows)}</tbody></table>
+{html_table(["Makefile switch", "Scope", "Existing CMake", "Generated CMake", "Matched CMake symbols", "Known aliases", "Conditional assignments", "Locations"], switch_rows)}
 </body>
 </html>
 """
@@ -960,7 +1491,9 @@ code {{ background: #f6f8fa; padding: 2px 4px; }}
 def build_tasks() -> list[Task]:
     return [
         Task("discover", [], discover),
-        Task("parse_makefiles", ["discover"], parse_makefiles),
+        Task("parse_configs", [], parse_configs),
+        Task("parse_project_variables", ["parse_configs"], parse_project_variables),
+        Task("parse_makefiles", ["discover", "parse_configs", "parse_project_variables"], parse_makefiles),
         Task("convert_makefiles", ["parse_makefiles"], convert_makefiles),
         Task("extract_existing_cmake", ["discover"], extract_existing_cmake),
         Task("compare_with_existing", ["convert_makefiles", "extract_existing_cmake"], compare_with_existing),
@@ -975,6 +1508,10 @@ def main() -> int:
     parser.add_argument("--root", required=True)
     parser.add_argument("--state-dir", default="state-lite")
     parser.add_argument("--focus", action="append", default=[])
+    parser.add_argument("--config-file", "--config", action="append", dest="config_files", default=[])
+    parser.add_argument("--var-file", "--preload-mk", action="append", dest="var_files", default=[])
+    parser.add_argument("--makefile", action="append", dest="makefiles", default=[])
+    parser.add_argument("--makefile-name", action="append", dest="makefile_names", default=[])
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -985,7 +1522,16 @@ def main() -> int:
     state_dir = state_dir.resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     focus = args.focus or ["lib", "src"]
-    ctx = {"root": root, "state_dir": state_dir, "focus": focus, "force": args.force}
+    ctx = {
+        "root": root,
+        "state_dir": state_dir,
+        "focus": focus,
+        "force": args.force,
+        "config_files": args.config_files,
+        "var_files": args.var_files,
+        "makefiles": args.makefiles,
+        "makefile_names": args.makefile_names or ["Makefile.am"],
+    }
     run = DagExecutor(build_tasks(), ctx).run()
     print(f"lite_dag: {run['status']}")
     print(f"dashboard: {state_dir / 'dashboard.html'}")

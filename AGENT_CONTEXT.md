@@ -18,18 +18,23 @@ The previous LangGraph / LangChain / opencode scheduling implementation has been
 Node order:
 
 1. `discover`
-2. `parse_makefiles`
-3. `convert_makefiles`
-4. `extract_existing_cmake`
-5. `compare_with_existing`
-6. `analyze_config_switches`
-7. `check_generated_cmake`
-8. `render_dashboard`
+2. `parse_configs`
+3. `parse_project_variables`
+4. `parse_makefiles`
+5. `convert_makefiles`
+6. `extract_existing_cmake`
+7. `compare_with_existing`
+8. `analyze_config_switches`
+9. `check_generated_cmake`
+10. `render_dashboard`
 
 Durable outputs are written under the selected `--state-dir`:
 
 - `graph_run.json`
+- `dot_config.json`
+- `project_variables.json`
 - `make_ir.json`
+- `mk_dependencies.json`
 - `generated/`
 - `generated_manifest.json`
 - `comparison.json`
@@ -44,6 +49,8 @@ Durable outputs are written under the selected `--state-dir`:
 - Keep the DAG deterministic and inspectable through JSON plus static HTML.
 - Keep dependencies at Python standard library unless a future task explicitly justifies otherwise.
 - Validate source-list comparison and switch coverage when changing parser behavior.
+- Preserve config and mk include dependency parsing as deterministic JSON artifacts.
+- Preserve makefile classification and target operation ordering when changing conversion behavior.
 
 ## libcurl Validation
 

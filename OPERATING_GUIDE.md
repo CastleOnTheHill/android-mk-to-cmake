@@ -7,8 +7,10 @@
 `lite_dag/run.py` 使用 Python 标准库实现一个小型 DAG Executor。它把确定性任务拆成固定节点并按依赖顺序执行：
 
 - `discover`：发现指定 `--focus` 目录中的 `Makefile.am` 和 `CMakeLists.txt`。
-- `parse_makefiles`：解析 Automake 赋值、include、条件块和 target。
-- `convert_makefiles`：生成中间 CMake，并生成 `MakefileSwitches.cmake` 兼容开关层；脚本不能转换的 unknown 片段会按原解析顺序写成 TODO 注释。
+- `parse_configs`：解析指定的 `.config`、`.euap_config` 或其他 config 文件。
+- `parse_project_variables`：从指定的公共 mk 文件中预加载变量，例如 `TOPDIR`。
+- `parse_makefiles`：解析 Automake 赋值、include、条件块和 target，用 config/预加载变量解析 mk include 依赖，并识别 `target_definition`、`judgment_package`、`variable_fragment`。
+- `convert_makefiles`：生成中间 CMake，并生成 `MakefileSwitches.cmake` 兼容开关层；target 定义型 mk 中的条件追加会按 target 归属转换成 `target_sources()`、`target_include_directories()`、`target_compile_definitions()`、`target_compile_options()` 等命令，脚本不能转换的 unknown 片段会按原解析顺序写成 TODO 注释。
 - `extract_existing_cmake`：读取已有 CMake target 信息。
 - `compare_with_existing`：对比生成 target source 和既有 CMake baseline。
 - `analyze_config_switches`：检查 Automake 条件开关是否映射到已有 CMake 和生成 CMake。
@@ -33,6 +35,9 @@ python3 android-mk-to-cmake/lite_dag/run.py \
   --root /path/to/project \
   --state-dir /tmp/mk2cmake-state \
   --focus lib --focus src \
+  --config-file .config \
+  --config-file .euap_config \
+  --var-file build/top.mk \
   --force
 ```
 
@@ -41,6 +46,10 @@ python3 android-mk-to-cmake/lite_dag/run.py \
 - `--root`：被分析的源码根目录。
 - `--state-dir`：输出目录。相对路径会放到 `--root` 下；绝对路径会直接使用。
 - `--focus`：要转换的子目录，可重复传入；默认是 `lib` 和 `src`。
+- `--config-file` / `--config`：要读取的 config 文件，可重复传入。相对路径按 `--root` 解析；不传时会自动读取根目录下存在的 `.config` 和 `.euap_config`。
+- `--var-file` / `--preload-mk`：要预加载变量的公共 mk 文件，可重复传入。例如包含 `TOPDIR := ...` 的文件。
+- `--makefile-name`：在每个 `--focus` 目录下要发现的 makefile 文件名，可重复传入；默认是 `Makefile.am`。
+- `--makefile`：额外指定要解析的 makefile 路径，可重复传入。
 - `--force`：当前保留参数，便于后续扩展强制重跑语义。
 
 ## 4. 输出文件
@@ -49,7 +58,10 @@ python3 android-mk-to-cmake/lite_dag/run.py \
 
 - `graph_run.json`：每个 DAG 节点的状态、耗时、依赖和摘要。
 - `dashboard.html`：静态监控页面。
-- `make_ir.json`：解析后的 Makefile IR。
+- `dot_config.json`：多个 config 文件的解析结果。后传入的 config 对同名变量覆盖前面的值。
+- `project_variables.json`：默认变量、config 变量和 `--var-file` 中读取到的公共 mk 变量。
+- `make_ir.json`：解析后的 Makefile IR。每个入口包含 `package_kind`，每个被 include 的文件包含 `file_roles`，每个 target 包含按 mk 顺序记录的 `operations`。
+- `mk_dependencies.json`：解析出的 mk include 依赖边，包含 `from`、`to`、行号和原始 include 表达式。
 - `generated/`：脚本转换生成的中间 CMake 工程。每个子目录的 `CMakeLists.txt` 会保留可转换 target，并把动态 include、自定义 rule 等 unknown 片段按原顺序写成注释，供后续 AI 或人工继续处理。
 - `generated/MakefileSwitches.cmake`：Automake 条件开关到 CMake 兼容选项的声明。
 - `generated_manifest.json`：生成 target 和 source 列表。
